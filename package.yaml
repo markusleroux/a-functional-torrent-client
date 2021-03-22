@@ -1,0 +1,60 @@
+name:                a-functional-torrent-client
+version:             0.1.0.0
+github:              "markusleroux/a-functional-torrent-client"
+license:             BSD3
+author:              "Markus Le Roux"
+maintainer:          "markusleroux314@gmail.com"
+copyright:           "GNU GPL"
+
+extra-source-files:
+- README.md
+- ChangeLog.md
+
+# Metadata used when publishing your package
+# synopsis:            Short description of your package
+# category:            Web
+
+# To avoid duplicated efforts in documentation and dealing with the
+# complications of embedding Haddock markup inside cabal files, it is
+# common to point users to the README.md file.
+description:         Please see the README on GitHub at <https://github.com/markusleroux/a-functional-torrent-client#readme>
+
+dependencies:
+- base >= 4.7 && < 5
+
+library:
+  source-dirs: src
+  dependencies:
+  - bytestring
+  - text
+  - attoparsec
+  - microlens-ghc
+  - microlens-th
+  - unordered-containers
+  - utf8-string
+  - binary
+  - req
+  - cryptohash
+  - network-simple
+
+executables:
+  a-functional-torrent-client-exe:
+    main:                Main.hs
+    source-dirs:         app
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - a-functional-torrent-client
+
+tests:
+  a-functional-torrent-client-test:
+    main:                Spec.hs
+    source-dirs:         test
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - a-functional-torrent-client
