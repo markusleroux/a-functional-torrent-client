@@ -28,6 +28,7 @@ library
       Bencode
       Client
       Lib
+      Piece
       Torrent
       Tracker
   other-modules:
@@ -35,16 +36,20 @@ library
   hs-source-dirs:
       src
   build-depends:
-      attoparsec
+      array
+    , attoparsec
     , base >=4.7 && <5
     , binary
+    , bitwise
     , bytestring
     , cryptohash
     , microlens-ghc
     , microlens-th
     , network-simple
     , req
+    , stm
     , text
+    , transformers
     , unordered-containers
     , utf8-string
   default-language: Haskell2010

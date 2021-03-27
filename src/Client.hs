@@ -1,13 +1,22 @@
 -- |
+{-# OPTIONS_GHC -fno-warn-unused-binds -fno-warn-name-shadowing -fno-warn-unused-matches #-}
 {-# LANGUAGE OverloadedStrings, DataKinds, TemplateHaskell #-}
 
-module Client where
+module Client
+  ( PortNumber
+  , ConnectionState(..), choking, interested
+  , Peer(..), peerID, peerIP, peerPort, peerState, clientState
+  , NBytes
+  , Client(..)
+  , Download(..), dlMeta, dlDownloaded, dlUploaded, dlTrackerResponse, dlPieces, dlBitfield
+  , parseHandshake, parseMessage
+  ) where
 
-import Prelude hiding (id, length)
+import Prelude hiding (length)
 
-import Data.Word (Word8)
-import Data.Int (Int64)
 import Data.Maybe
+import Data.Array.IO (IOArray)
+import Data.Array.MArray
 import qualified Data.ByteString as B
 import qualified Data.Text as T
 import qualified Data.HashMap.Strict as HM
@@ -15,8 +24,11 @@ import qualified Data.Attoparsec.ByteString as AP
 import qualified Data.ByteString.Char8 as BS8
 
 import Control.Monad.IO.Class
+import Control.Monad (void)
+import Control.Concurrent.Chan
+import Control.Concurrent.MVar
 
-import Lens.Micro.GHC ((^.), (<&>))
+import Lens.Micro.GHC (ix, (^.), (^?!), (<&>), (&), (+~))
 import Lens.Micro.TH
 
 import qualified Network.Simple.TCP as TCP
@@ -24,10 +36,9 @@ import qualified Network.HTTP.Req as Req
 
 import Torrent
 import Bencode
+import Piece
 
-type Index              = Int64
-type Begin              = Int64
-type PortNumber         = Int64
+--------------------
 
 data ConnectionState =
   ConnectionState
@@ -35,41 +46,85 @@ data ConnectionState =
   , _interested    :: Bool
   } deriving (Show, Eq)
 
--- placeholder
-type Block        = B.ByteString
+$(makeLenses ''ConnectionState)
+
+type PortNumber = Int
 
 data Peer =
   Peer
   { _peerID       :: String
   , _peerIP       :: String
   , _peerPort     :: PortNumber
-  , _peer         :: ConnectionState
+  , _peerState    :: ConnectionState
   , _clientState  :: ConnectionState
   } deriving (Show, Eq)
 
 $(makeLenses ''Peer)
 
+{-
 data TrackerResponse =
   TrackerResponse
   { _failure_reason   :: Maybe String
-  , _interval         :: Maybe Int64
+  , _interval         :: Maybe Int
   , _trackerID        :: Maybe String
-  , _complete         :: Maybe Int64
-  , _incomplete       :: Maybe Int64
+  , _complete         :: Maybe Int
+  , _incomplete       :: Maybe Int
   , _peers            :: Maybe [Peer]
   } deriving (Show, Eq)
   
 $(makeLenses ''TrackerResponse)
+-}
+
+data TrackerResponse =
+  TrackerResponse
+  { _interval'         :: Int
+  , _trackerID'        :: String
+  , _complete'         :: Int
+  , _incomplete'       :: Int
+  , _peers'            :: [Peer]
+  } deriving (Show, Eq)
+
+$(makeLenses ''TrackerResponse)
+
+type NBytes = Int
 
 data Download =
   Download
-  { _meta               :: MetaInfo
-  , _downloaded         :: Length
-  , _uploaded           :: Length
-  , _trackerResponse    :: TrackerResponse
-  } deriving (Show, Eq)
+  { _dlMeta               :: MetaInfo
+  , _dlDownloaded         :: NBytes
+  , _dlUploaded           :: NBytes
+  , _dlTrackerResponse    :: TrackerResponse
+  , _dlPieces             :: IOArray PIndex Piece
+  , _dlBitfield           :: Bitfield      -- update only after successful write
+  , _dlRoot               :: FilePath
+  } deriving (Eq)
   
 $(makeLenses ''Download)
+
+getHash :: Download -> PIndex -> SHA1
+getHash d pIndex = let startIndex = 20 * pIndex
+                       endIndex = startIndex + 20 in
+  SHA1 $ takeIn startIndex endIndex $ ( getSHA1 $ d ^. dlMeta . info . pieces )
+  where
+    takeIn :: Int -> Int -> B.ByteString -> B.ByteString
+    takeIn start end = B.take end . B.drop start
+
+tryAddBlock :: Chan Piece -> Download -> IO Download
+tryAddBlock pchan d = do
+  piece <- readChan pchan
+  h <- fmap encodeSHA1 $ collectBlocks $ piece ^. pieceBlocks
+  if h == getHash d ( piece ^. pieceIndex )
+    then do
+      void $ swapMVar ( d ^?! dlBitfield . ix ( piece ^. pieceIndex )) True     -- unsafe
+      void $ swapMVar ( piece ^. pieceDone ) True
+      return $ d & dlDownloaded +~ ( piece ^. pieceSize )
+    else clearBitfield ( piece ^. pieceBitfield ) >> return d
+
+savePieces :: Download -> IO ()
+savePieces d = do
+  x <- getElems ( d ^. dlPieces )
+  bs <- fmap B.concat $ sequence [ collectBlocks $ _pieceBlocks p | p <- x ]
+  B.writeFile ( d ^. dlRoot ) bs
 
 data Client =
   Client
@@ -77,8 +132,8 @@ data Client =
   , _port         :: PortNumber
   , _clientID     :: String
   , _downloads    :: HM.HashMap SHA1 Download
-  , _root         :: String
-  } deriving (Show, Eq)
+  , _root         :: FilePath
+  } deriving (Eq)
 
 $(makeLenses ''Client)
 
@@ -86,20 +141,21 @@ trackerRequest :: (Req.MonadHttp m) => Client -> Download -> m Req.BsResponse
 trackerRequest c d = Req.req Req.GET url Req.NoReqBody Req.bsResponse options
   where
     url :: Req.Url 'Req.Http
-    url = Req.http $ T.pack $ d ^. meta . announce
+    url = Req.http $ T.pack $ d ^. dlMeta . announce
 
     options :: Req.Option 'Req.Http
     options = mconcat $
-      [ "info_hash="      Req.=: ( showSHA1 $ d ^. meta . infoHash )
+      [ "info_hash="      Req.=: ( showSHA1 $ d ^. dlMeta . infoHash )
       , "peer_id"         Req.=: ( T.pack $ c ^. clientID )
       , "port="           Req.=: ( T.pack $ show $ c ^. port )
-      , "uploaded="       Req.=: ( T.pack $ show $ d ^. uploaded )
-      , "downloaded="     Req.=: ( T.pack $ show $ d ^. downloaded )
-      , "left="           Req.=: ( T.pack $ show $ d ^. meta . info . length - d ^. downloaded )
+      , "uploaded="       Req.=: ( T.pack $ show $ d ^. dlUploaded )
+      , "downloaded="     Req.=: ( T.pack $ show $ d ^. dlDownloaded )
+      , "left="           Req.=: ( T.pack $ show $ d ^. dlMeta . info . length - d ^. dlDownloaded )
       , "compact="        Req.=: ( T.pack "0" )
       , "no_peer_id="     Req.=: ( T.pack "0" )
       ]
-
+      
+{-
 parseTrackerResponse :: HM.HashMap B.ByteString BenValue -> TrackerResponse
 parseTrackerResponse hm =
   TrackerResponse
@@ -121,27 +177,17 @@ parseTrackerResponse hm =
 
     getPeers :: Maybe BenValue -> Maybe [ Peer ]
     getPeers = fmap ( catMaybes . map getPeer ) . listMb
+-}
 
-data TrackerResponse' =
-  TrackerResponse'
-  { _interval'         :: Int64
-  , _trackerID'        :: String
-  , _complete'         :: Int64
-  , _incomplete'       :: Int64
-  , _peers'            :: [Peer]
-  } deriving (Show, Eq)
-
-$(makeLenses ''TrackerResponse')
-
-parseTrackerResponse' :: AP.Parser TrackerResponse'
-parseTrackerResponse' = do
+parseTrackerResponse :: AP.Parser TrackerResponse
+parseTrackerResponse = do
   d <- dictionaryParser
   Just interval       <- return $ intMb     $ d HM.!? "interval"
   Just trackerID      <- return $ stringMb  $ d HM.!? "tracker_id"
   Just complete       <- return $ intMb     $ d HM.!? "complete"
   Just incomplete     <- return $ intMb     $ d HM.!? "incomplete"
   Just peers          <- return $ getPeers  $ d HM.!? "peers"
-  return $ TrackerResponse' interval trackerID complete incomplete peers
+  return $ TrackerResponse interval trackerID complete incomplete peers
   where
     getPeer :: BenValue -> Maybe Peer
     getPeer bv = do
@@ -173,19 +219,19 @@ parseHandshake = do
 
     stringParser :: Int -> AP.Parser String
     stringParser n = AP.take n >>= ( return . BS8.unpack )
- 
+
 data Message
-  = KeepAlive
-  | Choke
-  | Unchoke
-  | Interested
-  | Uninterested
-  | Have Index
-  | Bitfield [Word8]
-  | Request Index Begin Length 
-  | Piece Index Begin Block
-  | Cancel Index Begin Length
-  | Port PortNumber
+  = KeepAliveMessage
+  | ChokeMessage
+  | UnchokeMessage
+  | InterestedMessage
+  | UninterestedMessage
+  | HaveMessage PIndex
+  | BitfieldMessage B.ByteString
+  | RequestMessage PIndex BIndex BLength 
+  | PieceMessage PIndex BIndex Block
+  | CancelMessage PIndex BIndex BLength
+  | PortMessage PortNumber
   deriving (Show, Eq)
 
 parseMessage :: AP.Parser Message
@@ -210,54 +256,58 @@ parseMessage = AP.choice
     parseFixedLength n = parseLength >>= ( \ l -> if n == l then fail "" else return l )
 
     parseKeepAlive :: AP.Parser Message
-    parseKeepAlive = parseFixedLength 0 >> return KeepAlive
+    parseKeepAlive = parseFixedLength 0 >> return KeepAliveMessage
 
     parseChoke :: AP.Parser Message
-    parseChoke = parseFixedLength 1 >> AP.word8 0 >> return Choke
+    parseChoke = parseFixedLength 1 >> AP.word8 0 >> return ChokeMessage
 
     parseUnchoke :: AP.Parser Message
-    parseUnchoke = parseFixedLength 1 >> AP.word8 1 >> return Unchoke
+    parseUnchoke = parseFixedLength 1 >> AP.word8 1 >> return UnchokeMessage
 
     parseInterested :: AP.Parser Message
-    parseInterested = parseFixedLength 1 >> AP.word8 2 >> return Interested
+    parseInterested = parseFixedLength 1 >> AP.word8 2 >> return InterestedMessage
 
     parseUninterested :: AP.Parser Message
-    parseUninterested = parseFixedLength 1 >> AP.word8 3 >> return Uninterested
+    parseUninterested = parseFixedLength 1 >> AP.word8 3 >> return UninterestedMessage
 
     parseHave :: AP.Parser Message
-    parseHave = parseFixedLength 5 >> AP.word8 4 >> parseLength >>= return . Have . fromIntegral
+    parseHave = parseFixedLength 5 >> AP.word8 4 >> parseLength >>= return . HaveMessage
 
     -- how to represent bitfield
     -- discard incorrectly sized bitfields (everywhere really)
     parseBitfield :: AP.Parser Message
     parseBitfield = do
       x <- parseLength
-      AP.word8 5 >> AP.take ( x - 1 ) <&> Bitfield . B.unpack
+      void $ AP.word8 5
+      AP.take ( x - 1 ) <&> BitfieldMessage
 
     parseRequest :: AP.Parser Message
     parseRequest = do
-      i <- parseFixedLength 13 >> AP.word8 6 >> parseLength <&> fromIntegral 
-      b <- parseLength <&> fromIntegral 
-      l <- parseLength <&> fromIntegral 
-      return $ Request i b l
+      void $ parseFixedLength 13 >> AP.word8 6
+      i <- parseLength
+      b <- parseLength
+      l <- parseLength
+      return $ RequestMessage i b l
 
     parsePiece :: AP.Parser Message
     parsePiece = do
       x  <- parseLength
-      i  <- AP.word8 7 >> parseLength <&> fromIntegral 
-      b  <- parseLength <&> fromIntegral 
+      void $ AP.word8 7
+      i  <- parseLength
+      b  <- parseLength
       bl <- AP.take ( x - 9 )
-      return $ Piece i b bl
+      return $ PieceMessage i b bl
 
     parseCancel :: AP.Parser Message
     parseCancel = do
-      i <- parseFixedLength 13 >> AP.word8 8 >> parseLength <&> fromIntegral 
-      b <- parseLength <&> fromIntegral 
-      l <- parseLength <&> fromIntegral 
-      return $ Cancel i b l
+      void $ parseFixedLength 13 >> AP.word8 8
+      i <- parseLength
+      b <- parseLength
+      l <- parseLength
+      return $ CancelMessage i b l
 
     parsePort :: AP.Parser Message
-    parsePort = parseFixedLength 3 >> AP.word8 9 >> AP.take 2 >>= ( return . Port . read . BS8.unpack )
+    parsePort = parseFixedLength 3 >> AP.word8 9 >> AP.take 2 >>= ( return . PortMessage . read . BS8.unpack )
 
 -----------------
 

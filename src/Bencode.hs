@@ -1,7 +1,18 @@
 -- | 
-module Bencode where
+module Bencode
+  ( BenValue(..)
+  , benStringParser
+  , benIntParser
+  , benListParser
+  , dictionaryParser
+  , benDictionaryParser
+  , benValueParser
+  , intMb
+  , listMb
+  , stringMb
+  , dictionaryMb
+  ) where
 
-import Data.Int (Int64)
 import qualified Data.ByteString as B
 import qualified Data.HashMap.Strict as HM
 import qualified Data.ByteString.Char8 as BS8
@@ -11,8 +22,10 @@ import Data.Attoparsec.ByteString.Char8 (char, signed, decimal)
 
 import Lens.Micro.GHC ((<&>))
 
+------------------
+
 data BenValue = BenString B.ByteString
-              | BenInt Int64
+              | BenInt Int
               | BenList [BenValue]
               | BenMap ( HM.HashMap B.ByteString BenValue )
     deriving (Show, Eq)
@@ -23,7 +36,7 @@ byteStringParser = decimal >>= ( \ n -> char ':' >> AP.take n )
 benStringParser :: AP.Parser BenValue
 benStringParser = BenString <$> byteStringParser
 
-intParser :: AP.Parser Int64
+intParser :: AP.Parser Int
 intParser = char 'i' *> signed decimal <* char 'e'
 
 benIntParser :: AP.Parser BenValue
@@ -49,7 +62,7 @@ benValueParser = AP.choice [benStringParser, benIntParser, benListParser, benDic
 
 ----------------
 
-intMb :: Maybe BenValue -> Maybe Int64
+intMb :: Maybe BenValue -> Maybe Int
 intMb ( Just ( BenInt n ) ) = Just n
 intMb _ = Nothing
 

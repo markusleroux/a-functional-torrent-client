@@ -36,6 +36,10 @@ library:
   - req
   - cryptohash
   - network-simple
+  - array
+  - bitwise
+  - stm
+  - transformers
 
 executables:
   a-functional-torrent-client-exe:

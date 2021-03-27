@@ -2,27 +2,29 @@
 
 {-# LANGUAGE OverloadedStrings, TemplateHaskell #-}
 
-module Torrent where
+module Torrent
+  ( FLength
+  , MetaInfo(..)
+  , announce
+  , infoHash
+  , info
+  , TorrentInfo(..)
+  , name
+  , piecesLength
+  , pieces
+  , length
+  ) where
 
-import Data.Int (Int64)
-import qualified Crypto.Hash.SHA1 as SHA1
-import qualified Data.Text as T
-import Data.Text.Encoding (decodeUtf8)
-
-import qualified Data.ByteString as B
+import Prelude hiding (id, length)
 
 --import Lens.Micro.GHC
 import Lens.Micro.TH
 
-type Length = Int64
+import Piece (PLength, SHA1(..))
 
-newtype SHA1 = SHA1 { getSHA1 :: B.ByteString } deriving (Show, Eq)
+---------------
 
-encodeSHA1 :: B.ByteString -> SHA1
-encodeSHA1 = SHA1 . SHA1.hash
-
-showSHA1 :: SHA1 -> T.Text
-showSHA1 = decodeUtf8 . getSHA1
+type FLength = Int
 
 data MetaInfo = Meta
   { _announce     :: String            -- the URL of the tracker
@@ -32,9 +34,9 @@ data MetaInfo = Meta
 
 data TorrentInfo = TorrentInfo
   { _name            :: Maybe String    -- the suggested name for the file/directory
-  , _piecesLength    :: Length          -- the number of bytes in each piece of the torrent
+  , _piecesLength    :: PLength         -- the number of bytes in each piece of the torrent
   , _pieces          :: SHA1            -- SHA1 hashes of the pieces
-  , _length          :: Length          -- length of the file in bytes (could also be files key for multi-file torrent)
+  , _length          :: FLength         -- length of the file in bytes (could also be files key for multi-file torrent)
   } deriving (Show, Eq)
 
 $(makeLenses ''MetaInfo)
