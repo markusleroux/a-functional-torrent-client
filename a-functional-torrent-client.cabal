@@ -27,10 +27,10 @@ library
   exposed-modules:
       Bencode
       Client
+      Download
       Lib
+      Peer
       Piece
-      Torrent
-      Tracker
   other-modules:
       Paths_a_functional_torrent_client
   hs-source-dirs:

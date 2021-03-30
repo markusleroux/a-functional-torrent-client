@@ -1,17 +1,5 @@
 -- | 
-module Bencode
-  ( BenValue(..)
-  , benStringParser
-  , benIntParser
-  , benListParser
-  , dictionaryParser
-  , benDictionaryParser
-  , benValueParser
-  , intMb
-  , listMb
-  , stringMb
-  , dictionaryMb
-  ) where
+module Bencode where
 
 import qualified Data.ByteString as B
 import qualified Data.HashMap.Strict as HM
@@ -24,29 +12,24 @@ import Lens.Micro.GHC ((<&>))
 
 ------------------
 
-data BenValue = BenString B.ByteString
-              | BenInt Int
-              | BenList [BenValue]
-              | BenMap ( HM.HashMap B.ByteString BenValue )
+data BenValue
+  = BenString B.ByteString
+  | BenInt Int
+  | BenList [BenValue]
+  | BenMap ( HM.HashMap B.ByteString BenValue )
     deriving (Show, Eq)
 
 byteStringParser :: AP.Parser B.ByteString
 byteStringParser = decimal >>= ( \ n -> char ':' >> AP.take n )
 
 benStringParser :: AP.Parser BenValue
-benStringParser = BenString <$> byteStringParser
-
-intParser :: AP.Parser Int
-intParser = char 'i' *> signed decimal <* char 'e'
+benStringParser = byteStringParser <&> BenString
 
 benIntParser :: AP.Parser BenValue
-benIntParser = BenInt <$> intParser
-
-listParser :: AP.Parser [BenValue]
-listParser = char 'l' *> AP.many' benValueParser <* char 'e'
+benIntParser = char 'i' *> signed decimal <* char 'e' <&> BenInt
 
 benListParser :: AP.Parser BenValue
-benListParser = BenList <$> listParser
+benListParser = char 'l' *> AP.many' benValueParser <* char 'e' <&> BenList
 
 dictionaryParser :: AP.Parser (HM.HashMap B.ByteString BenValue)
 dictionaryParser = char 'd' *> AP.many' pair <* char 'e' <&> HM.fromList
@@ -62,21 +45,25 @@ benValueParser = AP.choice [benStringParser, benIntParser, benListParser, benDic
 
 ----------------
 
-intMb :: Maybe BenValue -> Maybe Int
-intMb ( Just ( BenInt n ) ) = Just n
+intMb :: BenValue -> Maybe Int
+intMb ( BenInt n ) = Just n
 intMb _ = Nothing
 
-listMb :: Maybe BenValue -> Maybe [BenValue]
-listMb ( Just ( BenList xs ) ) = Just xs
+listMb :: BenValue -> Maybe [BenValue]
+listMb ( BenList xs ) = Just xs
 listMb _ = Nothing
 
-bstringMb :: Maybe BenValue -> Maybe B.ByteString
-bstringMb ( Just ( BenString s ) ) = Just s
+bstringMb :: BenValue -> Maybe B.ByteString
+bstringMb ( BenString s ) = Just s
 bstringMb _ = Nothing
 
-stringMb :: Maybe BenValue -> Maybe String
+stringMb :: BenValue -> Maybe String
 stringMb = fmap BS8.unpack . bstringMb
 
-dictionaryMb :: Maybe BenValue -> Maybe ( HM.HashMap B.ByteString BenValue )
-dictionaryMb ( Just ( BenMap hm ) ) = Just hm
+dictionaryMb :: BenValue -> Maybe ( HM.HashMap B.ByteString BenValue )
+dictionaryMb ( BenMap hm ) = Just hm
 dictionaryMb _ = Nothing
+
+-------------
+stringParser :: Int -> AP.Parser String
+stringParser n = AP.take n >>= ( return . BS8.unpack )
