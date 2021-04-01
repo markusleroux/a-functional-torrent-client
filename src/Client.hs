@@ -10,6 +10,7 @@ import qualified Data.Text as T
 import qualified Data.HashMap.Strict as HM
 
 import Control.Monad.IO.Class
+import Data.IORef
 
 import Lens.Micro.GHC ((^.))
 import Lens.Micro.TH
@@ -40,20 +41,23 @@ $(makeLenses ''Handle)
 new :: Config -> Handle
 new c = Handle { _hConfig = c, _hDownloads = HM.empty }
 
-trackerRequest :: (Req.MonadHttp m) => Handle -> Down.Handle -> m Req.BsResponse
-trackerRequest client d = Req.req Req.GET url Req.NoReqBody Req.bsResponse options
+trackerRequest :: Req.MonadHttp m => Handle -> Down.Handle -> IO ( m Req.BsResponse )
+trackerRequest client d = do
+  down  <- readIORef $ d ^. Down.hDownloaded
+  up    <- readIORef $ d ^. Down.hUploaded
+  return $ Req.req Req.GET url Req.NoReqBody Req.bsResponse $ options down up
   where
     url :: Req.Url 'Req.Http
     url = Req.http $ T.pack $ d ^. Down.hMeta . Down.announce
 
-    options :: Req.Option 'Req.Http
-    options = mconcat $
+    options :: Int -> Int -> Req.Option 'Req.Http
+    options down up = mconcat $
       [ "info_hash="      Req.=: ( show   $ d ^. Down.hMeta . Down.infoHash )
       , "peer_id"         Req.=: ( T.pack $ client ^. hConfig . cID )
       , "port="           Req.=: ( T.pack $ show $ client ^. hConfig . cPort )
-      , "uploaded="       Req.=: ( T.pack $ show $ d ^. Down.hUploaded )
-      , "downloaded="     Req.=: ( T.pack $ show $ d ^. Down.hDownloaded )
-      , "left="           Req.=: ( T.pack $ show $ d ^. Down.hMeta . Down.info . Down.length - d ^. Down.hDownloaded )
+      , "uploaded="       Req.=: ( T.pack $ show $ up )
+      , "downloaded="     Req.=: ( T.pack $ show $ down )
+      , "left="           Req.=: ( T.pack $ show $ d ^. Down.hMeta . Down.info . Down.length - down )
       , "compact="        Req.=: ( T.pack "0" )
       , "no_peer_id="     Req.=: ( T.pack "0" )
       ]

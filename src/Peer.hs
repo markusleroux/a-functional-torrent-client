@@ -72,8 +72,8 @@ data PartialHandshake = PartialHandshake
 $(makeLenses ''PartialHandshake)
 
 instance Serialize PartialHandshake where
-  encode ph = toStrict $ BB.toLazyByteString $ mconcat
-    [ BB.int32BE $ fromIntegral $ length $ ph ^. pstrPartial
+  encode ph = toStrict . BB.toLazyByteString $ mconcat
+    [ BB.int32BE . fromIntegral . length $ ph ^. pstrPartial
     , BB.string8 $ ph ^. pstrPartial
     , BB.int64BE 0
     , BB.byteString $ Piece.getSHA1 $ ph ^. hsInfoHashPartial
@@ -176,12 +176,12 @@ parseMsg = AP.choice
 
     parsePiece :: AP.Parser Msg
     parsePiece = do
-      x  <- parseLength
+      _bLength  <- parseLength
       void $ AP.word8 7
-      i  <- parseLength
-      b  <- parseLength
-      bl <- AP.take ( x - 9 )
-      return $ PieceMsg $ Piece.Block i b bl
+      _pIndex  <- parseLength
+      _bIndex  <- parseLength
+      _bData <- AP.take ( _bLength - 9 )
+      return $ PieceMsg Piece.Block{..}
 
     parseCancel :: AP.Parser Msg
     parseCancel = do

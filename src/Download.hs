@@ -15,6 +15,7 @@ import qualified Data.Attoparsec.ByteString as AP
 
 import Control.Concurrent.Chan
 import Control.Concurrent.MVar
+import Control.Monad
 
 import Lens.Micro.TH
 import Lens.Micro.GHC (ix, (^.), (^?!), (&), (?~))
@@ -114,7 +115,7 @@ data Handle = Handle
   , _hTrackerResponse    :: TrackerResponse
   , _hPieces             :: IOArray Piece.Index Piece.Handle
   , _hChannel            :: Chan Piece.Handle
-  , _hBitfield           :: Piece.Bitfield      -- update only after successful write
+  , _hBitfield           :: Piece.Bitfield
   , _hRoot               :: FilePath
   } deriving (Eq)
   
@@ -122,8 +123,8 @@ $(makeLenses ''Handle)
 
 new :: MetaInfo -> TrackerResponse -> FilePath -> IO Handle
 new _hMeta _hTrackerResponse _hRoot = let l = ceilDiv ( _hMeta ^. info . length ) ( _hMeta ^. info . piecesLength ) in
-  do _hPieces     <- sequence [ Piece.new i ( _hMeta ^. info . piecesLength ) () ( getHash _hMeta i ) | i <- [0..l] ]
-                       >>= MA.newListArray (0, l)
+  do _hPieces     <- MA.newListArray (0, l)
+                      =<< sequence [ Piece.new i ( _hMeta ^. info . piecesLength ) ( getHash _hMeta i ) | i <- [0..l] ]
      _hBitfield   <- Piece.newBitfield l          
      _hDownloaded <- newIORef 0
      _hUploaded   <- newIORef 0
@@ -134,21 +135,19 @@ new _hMeta _hTrackerResponse _hRoot = let l = ceilDiv ( _hMeta ^. info . length 
     ceilDiv a b = -div ( -a ) b
 
 getPath :: Handle -> Maybe FilePath
-getPath h = (++) ( h ^. hRoot ) <$> h ^. hMeta . info . name
+getPath h = ( h ^. hRoot ++ ) <$> h ^. hMeta . info . name
 
-tryAddBlock :: Handle -> IO ()
-tryAddBlock d = do
-  piece <- readChan $ d ^. hChannel
-  h     <- Piece.newSHA1 <$> Piece.collectBlocks piece
-  if h == getHash ( d ^. hMeta ) ( piece ^. Piece.hIndex )
-    then do
-      sequence_ $ map ( flip swapMVar True )
-        $ [d ^?! hBitfield . ix ( piece ^. Piece.hIndex ), piece ^. Piece.hDone]     -- unsafe
-      modifyIORef ( d ^. hDownloaded ) ( piece ^. Piece.hSize + )
-    else Piece.clearBitfield ( piece ^. Piece.hBitfield )
+processChan :: Handle -> IO ()
+processChan h =  do
+  ph@( Piece.Incomplete blocks ) <- readChan $ h ^. hChannel
+  let pi = blocks ^. Piece.hIndex
+  validHash <- Piece.verify blocks
+  when validHash $
+    do flip modifyMVar_ ( const $ return True ) $ h ^?! hBitfield . ix pi
+       join $ MA.writeArray ( h ^. hPieces ) pi <$> Piece.complete ph
+       modifyIORef ( h ^. hDownloaded ) ( blocks ^. Piece.hSize + )
 
-savePieces :: Handle -> IO ()
-savePieces d = do
-  x  <- getElems ( d ^. hPieces )
-  bs <- B.concat <$> sequence [ Piece.collectBlocks p | p <- x ]
-  B.writeFile ( d ^. hRoot ) bs
+writePieces :: Handle -> IO ()
+writePieces h = do
+  xs  <- getElems ( h ^. hPieces )
+  B.writeFile ( h ^. hRoot ) $ B.concat [ x | Piece.Complete x <- xs ]
