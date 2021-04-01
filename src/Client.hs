@@ -10,7 +10,7 @@ import qualified Data.Text as T
 import qualified Data.HashMap.Strict as HM
 
 import Control.Monad.IO.Class
-import Data.IORef
+import Control.Concurrent.MVar
 
 import Lens.Micro.GHC ((^.))
 import Lens.Micro.TH
@@ -43,8 +43,8 @@ new c = Handle { _hConfig = c, _hDownloads = HM.empty }
 
 trackerRequest :: Req.MonadHttp m => Handle -> Down.Handle -> IO ( m Req.BsResponse )
 trackerRequest client d = do
-  down  <- readIORef $ d ^. Down.hDownloaded
-  up    <- readIORef $ d ^. Down.hUploaded
+  down  <- readMVar $ d ^. Down.hDownloaded
+  up    <- readMVar $ d ^. Down.hUploaded
   return $ Req.req Req.GET url Req.NoReqBody Req.bsResponse $ options down up
   where
     url :: Req.Url 'Req.Http

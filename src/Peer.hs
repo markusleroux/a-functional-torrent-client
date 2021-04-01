@@ -15,12 +15,12 @@ import Data.ByteString.Lazy (toStrict)
 import Control.Monad (void)
 
 import Lens.Micro.TH
-import Lens.Micro.GHC ((<&>), (^.), (.~))
+import Lens.Micro.GHC ((<&>), (^.), (%~))
 
 import qualified Piece
 import qualified Bencode
 
-----------------
+------- Handle --------
 
 data ConnectionState = ConnectionState
   { _choking       :: Bool
@@ -61,8 +61,16 @@ new ip port id = do
 newFromConfig :: Peer.Config -> IO Peer.Handle
 newFromConfig config = new ( config ^. hIP ) ( config ^. hPort ) ( config ^. hID )
 
+flipChoked, flipInterested :: IORef ConnectionState -> IO ()
+flipChoked = flip modifyIORef ( choking %~ not )
+flipInterested = flip modifyIORef ( interested %~ not )
+
+-------- Messaging ---------
+
 class Serialize a where
   encode :: a -> B.ByteString
+
+--- Messaging: Handshake ---
 
 data PartialHandshake = PartialHandshake
   { _pstrPartial        :: String
@@ -110,6 +118,8 @@ parseHandshakePartOne = do
 
 parseHandshakePartTwo :: PartialHandshake -> AP.Parser Handshake
 parseHandshakePartTwo ph = Bencode.stringParser 20  >>= return . handshakeFromPartial ph
+
+--- Messaging: General ---
 
 data Msg
   = KeepAliveMsg
@@ -191,11 +201,3 @@ parseMsg = AP.choice
 
     parsePort :: AP.Parser Msg
     parsePort = parseFixedLength 3 >> AP.word8 9 >> AP.take 2 >>= ( return . PortMsg . read . BS8.unpack )
-
-peerChoked, clientChoked  :: Handle -> IO ()
-peerChoked h = modifyIORef ( h ^. hPeerState ) ( choking .~ True )
-clientChoked h = modifyIORef ( h ^. hClientState ) ( choking .~ True )
-
-peerInterested, clientInterested  :: Handle -> IO ()
-peerInterested h = modifyIORef ( h ^. hClientState ) ( choking .~ True )
-clientInterested h = modifyIORef ( h ^. hClientState ) ( choking .~ True )

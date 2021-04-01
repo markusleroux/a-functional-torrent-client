@@ -1,12 +1,14 @@
 -- | 
 {-# OPTIONS_GHC -fno-warn-unused-binds -fno-warn-name-shadowing -fno-warn-unused-matches #-}
-{-# LANGUAGE OverloadedStrings, TemplateHaskell, RecordWildCards, GeneralizedNewtypeDeriving, DataKinds #-}
+{-# LANGUAGE OverloadedStrings, TemplateHaskell, RecordWildCards, GeneralizedNewtypeDeriving, DataKinds, FlexibleInstances #-}
 
 module Piece where
 
-import Data.Word
+import Data.Word 
+import Data.Bits
 import Data.Array (Array, listArray, elems)
 import Data.Array.IO (IOArray)
+import Data.Array.MArray
 import Data.Bits.Bitwise (toListBE)
 
 import qualified Data.ByteString as B
@@ -15,13 +17,12 @@ import qualified Data.ByteString.Builder as BB
 
 import qualified Crypto.Hash.SHA1 as SHA1
 
-import Lens.Micro.GHC (ix, strict, (^.), (^?), (<&>))
+import Lens.Micro.GHC (to, ix, strict, (^.), (^?), (&), (<&>), (^..))
 import Lens.Micro.TH
 
 import Control.Monad
 import Control.Concurrent.Chan
 import Control.Concurrent.MVar
-import Data.Array.MArray
 
 -------------
 
@@ -52,6 +53,20 @@ clearBitfield = sequence_ . fmap clearBit
     clearBit :: MVar Bool -> IO ()
     clearBit bMVar = void $ swapMVar bMVar False
 
+encodeBF :: Bitfield -> IO B.ByteString
+encodeBF arr = do
+  bs <- sequence . map readMVar $ elems arr
+  return . ( ^. strict ) . BB.toLazyByteString . mconcat $
+    [ BB.int32BE . fromIntegral $ length arr + 1
+    , BB.int8 5
+    , encodeBools bs 0
+    ]
+  where
+    encodeBools :: [Bool] -> Index -> BB.Builder
+    encodeBools [] i = mempty
+    encodeBools bs i = let (eight, rest) = splitAt 8 bs in
+      ( BB.word8 $ foldl (.|.) zeroBits $ fmap bit $ filter ( eight !! ) [0..8] ) <> encodeBools rest 8
+
 clearIOArray :: IOArray Int e -> e -> IO ()
 clearIOArray arr val = void $ mapArray ( const val ) arr
  
@@ -71,10 +86,11 @@ $(makeLenses ''Block)
 
 instance Serialize Block where
   encode b = ( ^. strict ) . BB.toLazyByteString . mconcat $
-    [ BB.int32BE . fromIntegral $ 9 + ( B.length $ b ^. bData )
-    , BB.int32BE . fromIntegral $ b ^. pIndex
-    , BB.int32BE . fromIntegral $ b ^. bIndex
-    , BB.byteString $ b ^. bData
+    [ b ^. bData . to B.length . to ( + 9 ) . to fromIntegral . to BB.int32BE
+    , BB.int32BE 7
+    , b ^. pIndex . to fromIntegral . to BB.int32BE
+    , b ^. bIndex . to fromIntegral . to BB.int32BE
+    , b ^. bData . to BB.byteString
     ]
 
 newBlock :: BIndex -> BLength -> Index -> Block
@@ -84,7 +100,6 @@ data Blocks = Blocks
   { _hIndex       :: Index                  -- index of the piece within download
   , _hSize        :: Length                 -- size of the piece in bytes
   , _hBlocks      :: IOArray Int Word8      -- array of data (update only after write to _pieceBitfield)
-  , _hHash        :: SHA1                   -- correct hash of the piece (from MetaInfo)
   , _hBitfield    :: Bitfield               -- indicate if data has been written
   } deriving (Eq)
 
@@ -94,7 +109,7 @@ instance Show Blocks where
   show p = concat [ "Piece ", show $ p ^. hIndex, ": ", show $ p ^. hSize, " blocks."]
 
 collectBlocks :: Blocks -> IO B.ByteString
-collectBlocks h = B.pack <$> getElems ( h ^. hBlocks )
+collectBlocks h = B.pack <$> ( h ^. hBlocks . to getElems  )
 
 data Handle = Complete B.ByteString | Incomplete Blocks
 
@@ -102,19 +117,16 @@ $(makeLenses ''Handle)
 
 new :: Index -> Length -> SHA1 -> IO Handle
 new _hIndex _hSize _hHash =
-  do _hBlocks   <- newListArray (0, _hSize) [ 0 | j <- [0.._hSize]]
+  do _hBlocks   <- newListArray (0, _hSize) [ 0 | _ <- [0.._hSize]]
      _hBitfield <- newBitfield _hSize
      return $ Incomplete Blocks{..}
-
-verify :: Blocks -> IO Bool
-verify b = ( Piece.collectBlocks b <&> Piece.newSHA1 ) >>= return . ( b ^. hHash == )
 
 complete :: Handle -> IO Handle
 complete ( Incomplete h ) = Complete <$> collectBlocks h
 complete c = return c
 
-tryAddBlock :: Handle -> Chan Handle -> Block -> IO ()
-tryAddBlock h@( Incomplete piece ) chan block = do
+writeBlock :: Handle -> Chan Handle -> Block -> IO ()
+writeBlock h@( Incomplete piece ) chan block = do
   addBlock ( block ^. bData ) ( block ^. bIndex ) ( block ^. bLength )
   isFinishedPiece <- and <$> ( sequence $ map readMVar $ elems bf )
   when isFinishedPiece $ writeChan chan h
@@ -128,6 +140,5 @@ tryAddBlock h@( Incomplete piece ) chan block = do
       | otherwise = return ()
   
     blocks = piece ^. hBlocks
-    bf = piece ^. hBitfield
-tryAddBlock _ _ _ = return ()
-
+    bf     = piece ^. hBitfield
+writeBlock _ _ _ = return ()

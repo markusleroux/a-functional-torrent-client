@@ -6,7 +6,6 @@ module Download where
 
 import Prelude hiding (id, length)
 
-import Data.IORef
 import Data.Array.IO (IOArray, getElems)
 import qualified Data.Array.MArray as MA
 import qualified Data.ByteString as B
@@ -18,7 +17,7 @@ import Control.Concurrent.MVar
 import Control.Monad
 
 import Lens.Micro.TH
-import Lens.Micro.GHC (ix, (^.), (^?!), (&), (?~))
+import Lens.Micro.GHC (ix, (^.), (^?!), (&), (<&>), (?~))
 
 import qualified Piece
 import qualified Peer
@@ -110,8 +109,8 @@ parseTrackerResponse = do
 
 data Handle = Handle
   { _hMeta               :: MetaInfo
-  , _hDownloaded         :: IORef Int
-  , _hUploaded           :: IORef Int
+  , _hDownloaded         :: MVar Int
+  , _hUploaded           :: MVar Int
   , _hTrackerResponse    :: TrackerResponse
   , _hPieces             :: IOArray Piece.Index Piece.Handle
   , _hChannel            :: Chan Piece.Handle
@@ -126,8 +125,8 @@ new _hMeta _hTrackerResponse _hRoot = let l = ceilDiv ( _hMeta ^. info . length 
   do _hPieces     <- MA.newListArray (0, l)
                       =<< sequence [ Piece.new i ( _hMeta ^. info . piecesLength ) ( getHash _hMeta i ) | i <- [0..l] ]
      _hBitfield   <- Piece.newBitfield l          
-     _hDownloaded <- newIORef 0
-     _hUploaded   <- newIORef 0
+     _hDownloaded <- newMVar 0
+     _hUploaded   <- newMVar 0
      _hChannel    <- newChan
      return Handle{..}
   where
@@ -137,17 +136,27 @@ new _hMeta _hTrackerResponse _hRoot = let l = ceilDiv ( _hMeta ^. info . length 
 getPath :: Handle -> Maybe FilePath
 getPath h = ( h ^. hRoot ++ ) <$> h ^. hMeta . info . name
 
+writeBlock :: Handle -> Piece.Block -> IO ()
+writeBlock h b = let pIO = h ^. hPieces
+                     pi  = b ^. Piece.pIndex in
+  do piece <- MA.readArray pIO pi :: IO Piece.Handle
+     Piece.writeBlock piece ( h ^. hChannel ) b
+
+verify :: Handle -> Piece.Blocks -> IO Bool
+verify h b = ( Piece.collectBlocks b <&> Piece.newSHA1 ) >>= return . ( == getHash ( h ^. hMeta ) ( b ^. Piece.hIndex ) )
+
 processChan :: Handle -> IO ()
 processChan h =  do
-  ph@( Piece.Incomplete blocks ) <- readChan $ h ^. hChannel
+  ph@( Piece.Incomplete blocks ) <- readChan $ h ^. hChannel -- only incomplete pieces in Channel ( unsafe )
   let pi = blocks ^. Piece.hIndex
-  validHash <- Piece.verify blocks
+  validHash <- verify h blocks
   when validHash $
-    do flip modifyMVar_ ( const $ return True ) $ h ^?! hBitfield . ix pi
+    do modifyMVar_ ( h ^?! hBitfield . ix pi ) ( const $ return True )
+       modifyMVar_ ( h ^. hDownloaded )        ( return . ( blocks ^. Piece.hSize + ) )
        join $ MA.writeArray ( h ^. hPieces ) pi <$> Piece.complete ph
-       modifyIORef ( h ^. hDownloaded ) ( blocks ^. Piece.hSize + )
+       
 
-writePieces :: Handle -> IO ()
-writePieces h = do
+writePiecesUnsafe :: Handle -> IO ()
+writePiecesUnsafe h = do
   xs  <- getElems ( h ^. hPieces )
   B.writeFile ( h ^. hRoot ) $ B.concat [ x | Piece.Complete x <- xs ]
