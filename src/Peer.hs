@@ -11,14 +11,17 @@ import qualified Data.Attoparsec.ByteString as AP
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Builder as BB
 import Data.ByteString.Lazy (toStrict)
+import Data.Array
+import Data.Maybe
 
 import Control.Monad (void)
 
 import Lens.Micro.TH
-import Lens.Micro.GHC ((<&>), (^.), (%~))
+import Lens.Micro.GHC (to, (&), (<&>), (^.), (%~), (.~), (?~))
 
 import qualified Piece
 import qualified Bencode
+import Types
 
 ------- Handle --------
 
@@ -29,18 +32,17 @@ data ConnectionState = ConnectionState
 
 $(makeLenses ''ConnectionState)
 
-type IP = String
-
 data Config = Config
-  { _hIP   :: IP
-  , _hPort  :: Int
-  , _hID    :: String
+  { _hIP    :: IP
+  , _hPort  :: Port
+  , _hID    :: ID
   } deriving (Show, Eq)
 
 $(makeLenses ''Config)
 
 data Handle = Handle
   { _hConfig       :: Config
+  , _hBFEi         :: Either DLength ( Array Int Bool )
   , _hPeerState    :: IORef ConnectionState
   , _hClientState  :: IORef ConnectionState
   }
@@ -53,73 +55,56 @@ instance Show Handle where
 instance Eq Handle where
   (==) h o = h ^. hConfig . hID == o ^. hConfig . hID
 
-new :: IP -> Int -> String -> IO Handle
-new ip port id = do
+newFromConfig :: Either DLength ( Array Int Bool ) -> Config -> IO Peer.Handle
+newFromConfig _hBFEi _hConfig = do
   [_hClientState, _hPeerState] <- sequence $ map newIORef $ replicate 2 $ ConnectionState True False
-  return $ Handle { _hConfig = Config { _hID = id, _hIP = ip, _hPort = port }, ..}
+  return $ Handle{ .. }
 
-newFromConfig :: Peer.Config -> IO Peer.Handle
-newFromConfig config = new ( config ^. hIP ) ( config ^. hPort ) ( config ^. hID )
+new :: IP -> Port -> ID -> Either DLength ( Array Int Bool ) -> IO Handle
+new _hIP _hPort _hID _hBFEi = newFromConfig _hBFEi $ Config { .. }
 
 flipChoked, flipInterested :: IORef ConnectionState -> IO ()
-flipChoked = flip modifyIORef ( choking %~ not )
+flipChoked     = flip modifyIORef ( choking %~ not )
 flipInterested = flip modifyIORef ( interested %~ not )
 
--------- Messaging ---------
-
-class Serialize a where
-  encode :: a -> B.ByteString
-
---- Messaging: Handshake ---
-
-data PartialHandshake = PartialHandshake
-  { _pstrPartial        :: String
-  , _hsInfoHashPartial  :: Piece.SHA1
-  } deriving (Show, Eq)
-
-$(makeLenses ''PartialHandshake)
-
-instance Serialize PartialHandshake where
-  encode ph = toStrict . BB.toLazyByteString $ mconcat
-    [ BB.int32BE . fromIntegral . length $ ph ^. pstrPartial
-    , BB.string8 $ ph ^. pstrPartial
-    , BB.int64BE 0
-    , BB.byteString $ Piece.getSHA1 $ ph ^. hsInfoHashPartial
-    ]
+------ Handshake -------
 
 data Handshake = Handshake
   { _pstr         :: String
   , _hsInfoHash   :: Piece.SHA1
-  , _hsPeerID     :: String
+  , _hsPeerID     :: Maybe ID
   } deriving (Show, Eq)
 
 $(makeLenses ''Handshake)
 
 instance Serialize Handshake where
-  encode h = toStrict $ BB.toLazyByteString $ mconcat
-    [ BB.int32BE $ fromIntegral $ length $ h ^. pstr
-    , BB.string8 $ h ^. pstr
-    , BB.int64BE 0
-    , BB.byteString $ Piece.getSHA1 $ h ^. hsInfoHash
-    , BB.string8 $ h ^. hsPeerID
-    ]
+  encode h
+    | h ^. hsPeerID . to isJust
+    = encode ( h & hsPeerID .~ Nothing ) <> ( h ^. hsPeerID . to fromJust . to BB.string8 . to BB.toLazyByteString . to toStrict )
+    | otherwise
+    = toStrict . BB.toLazyByteString $ mconcat
+      [ h ^. pstr . to length . to fromIntegral . to BB.int32BE
+      , h ^. pstr . to BB.string8
+      , BB.int64BE 0
+      , h ^. hsInfoHash . to Piece.getSHA1 . to BB.byteString
+      ]
 
-handshakeFromPartial :: PartialHandshake -> String -> Handshake
-handshakeFromPartial ph _hsPeerID = Handshake{ _pstr = ph ^. pstrPartial, _hsInfoHash = ph ^. hsInfoHashPartial, ..}
+handshakeFromPartial :: Handshake -> String -> Handshake
+handshakeFromPartial = flip ( hsPeerID ?~ )
 
-parseHandshakePartOne :: AP.Parser PartialHandshake
+parseHandshakePartOne :: AP.Parser Handshake
 parseHandshakePartOne = do
-  _pstrPartial       <- int8Parser >>= Bencode.stringParser
-  _hsInfoHashPartial <- Piece.SHA1 <$> ( AP.take 8 >> AP.take 20 )
-  return PartialHandshake{..}
+  _pstr       <- int8Parser >>= Bencode.stringParser
+  _hsInfoHash <- Piece.SHA1 <$> ( AP.take 8 >> AP.take 20 )
+  return Handshake{ _hsPeerID = Nothing, ..}
   where
     int8Parser :: AP.Parser Int
     int8Parser = AP.take 1 >>= return . read . BS8.unpack
 
-parseHandshakePartTwo :: PartialHandshake -> AP.Parser Handshake
+parseHandshakePartTwo :: Handshake -> AP.Parser Handshake
 parseHandshakePartTwo ph = Bencode.stringParser 20  >>= return . handshakeFromPartial ph
 
---- Messaging: General ---
+------ General -------
 
 data Msg
   = KeepAliveMsg
@@ -127,11 +112,11 @@ data Msg
   | UnchokeMsg
   | InterestedMsg
   | UninterestedMsg
-  | HaveMsg             Piece.Index
+  | HaveMsg             PIndex
   | BitfieldMsg         B.ByteString
-  | RequestMsg          Piece.Index Piece.BIndex Piece.BLength 
+  | RequestMsg          PIndex BIndex BLength 
   | PieceMsg            Piece.Block
-  | CancelMsg           Piece.Index Piece.BIndex Piece.BLength
+  | CancelMsg           PIndex BIndex BLength
   | PortMsg Int
   deriving (Show, Eq)
 
@@ -170,7 +155,6 @@ parseMsg = AP.choice
     parseHave :: AP.Parser Msg
     parseHave = parseFixedLength 5 >> AP.word8 4 >> parseLength >>= return . HaveMsg
 
-    -- how to represent bitfield
     -- discard incorrectly sized bitfields (everywhere really)
     parseBitfield :: AP.Parser Msg
     parseBitfield = do
@@ -188,9 +172,9 @@ parseMsg = AP.choice
     parsePiece = do
       _bLength  <- parseLength
       void $ AP.word8 7
-      _pIndex  <- parseLength
-      _bIndex  <- parseLength
-      _bData <- AP.take ( _bLength - 9 )
+      _pIndex <- parseLength
+      _bIndex <- parseLength
+      _bData  <- AP.take ( _bLength - 9 )
       return $ PieceMsg Piece.Block{..}
 
     parseCancel :: AP.Parser Msg
@@ -201,3 +185,4 @@ parseMsg = AP.choice
 
     parsePort :: AP.Parser Msg
     parsePort = parseFixedLength 3 >> AP.word8 9 >> AP.take 2 >>= ( return . PortMsg . read . BS8.unpack )
+    

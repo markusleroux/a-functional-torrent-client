@@ -40,6 +40,7 @@ library:
   - bitwise
   - stm
   - transformers
+  - tuple
 
 executables:
   a-functional-torrent-client-exe:
