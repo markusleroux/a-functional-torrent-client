@@ -12,14 +12,14 @@ import qualified Data.Array.MArray as MA
 import qualified Data.ByteString as B
 import qualified Data.HashMap.Strict as HM
 import qualified Data.Attoparsec.ByteString as AP
-import Data.Either (isLeft)
+import Data.Either (isLeft, fromLeft)
 
 import Control.Monad
 import Control.Concurrent.Chan
 import Control.Concurrent.MVar
 
 import Lens.Micro.TH
-import Lens.Micro.GHC (to, ix, (^.), (^?!), (&), (<&>), (?~), (.~))
+import Lens.Micro.GHC (to, ix, (^.), (^..), (^?!), (&), (<&>), (?~), (.~))
 
 import qualified Piece
 import qualified Peer
@@ -30,14 +30,14 @@ import Base
 
 data MetaInfo = Meta
   { _mAnnounce     :: String            -- the URL of the tracker
-  , _mInfoHash     :: Piece.SHA1              -- a hash of info dictionary
+  , _mInfoHash     :: SHA1              -- a hash of info dictionary
   , _mInfo         :: TorrentInfo       -- a dictionary describing the torrent
   } deriving (Show, Eq)
 
 data TorrentInfo = TorrentInfo
   { _tName            :: Maybe String    -- the suggested name for the file/directory
   , _tPLen            :: PLength         -- the number of bytes in each piece of the torrent
-  , _tPHash           :: Piece.SHA1            -- SHA1 hashes of the pieces
+  , _tPHash           :: SHA1            -- SHA1 hashes of the pieces
   , _tDLen            :: DLength         -- length of the file in bytes (could also be files key for multi-file torrent)
   } deriving (Show, Eq)
 
@@ -49,11 +49,11 @@ promptName t = do
   nm <- putStrLn "Please name the torrent." >> getLine
   return $ t & tName ?~ nm
 
-getHash :: MetaInfo -> PIndex -> Piece.SHA1
+getHash :: MetaInfo -> PIndex -> SHA1
 getHash meta pIndex =
   let startIndex = 20 * pIndex
       endIndex = startIndex + 20 in
-  Piece.SHA1 $ takeIn startIndex endIndex $ ( Piece.getSHA1 $ meta ^. mInfo . tPHash )
+  SHA1 $ takeIn startIndex endIndex $ ( getSHA1 $ meta ^. mInfo . tPHash )
   where
     takeIn :: Index -> Index -> B.ByteString -> B.ByteString
     takeIn start end = B.take end . B.drop start
@@ -67,6 +67,18 @@ data TrackerResponse = TrackerResponse
   } deriving (Eq)
 
 $(makeLenses ''TrackerResponse)
+
+hasPeerID :: TrackerResponse -> ID -> Bool
+hasPeerID tr id = either mapConfig mapHandle $ tr ^. trPeers
+  where
+    hasID :: [ID] -> Bool
+    hasID = elem id
+    
+    mapConfig :: [Peer.Config] -> Bool
+    mapConfig = hasID . map ( ^. Peer.hID )
+
+    mapHandle :: [Peer.Handle] -> Bool
+    mapHandle = hasID . map ( ^. Peer.hConfig . Peer.hID )
 
 newTrackerResponse :: Int -> ID -> Int -> Int -> [Peer.Config] -> TrackerResponse
 newTrackerResponse _trInterval _trID _trComplete _trIncomplete _trPeers = TrackerResponse{ _trPeers = Left _trPeers, .. }
@@ -99,14 +111,18 @@ parseTrackerResponse = do
 
 instance Serialize TrackerResponse where
   encode = undefined
-  decode = formatAP parseTrackerResponse
+  decode = parseTrackerResponse
 
 initPeers :: MetaInfo -> TrackerResponse -> IO TrackerResponse
 initPeers meta tr
-  | tr ^. trPeers . to isLeft = let Left pLeft = tr ^. trPeers in
-    do ps <- sequence $ map ( meta ^. mInfo . tDLen . to Left . to Peer.newFromConfig ) pLeft
+  | tr ^. trPeers . to isLeft =
+    do ps <- finishPeersList ( meta ^. mInfo . tDLen ) $ tr ^. trPeers
        return $ tr & trPeers .~ Right ps
   | otherwise = return tr
+ 
+finishPeersList :: Length -> Either [Peer.Config] [Peer.Handle] -> IO [Peer.Handle]
+finishPeersList l ( Left peers ) = sequence $ map ( Peer.newFromConfig $ Left l ) peers
+finishPeersList _ ( Right peers ) = return peers
 
 data Handle = Handle
   { _hMeta               :: MetaInfo
@@ -149,14 +165,17 @@ writeBlock h b =
   do piece <- MA.readArray pIO pi :: IO Piece.Handle
      Piece.writeBlock piece ( h ^. hChannel ) b
 
-verify :: Handle -> Piece.Blocks -> IO Bool
-verify h b = ( Piece.collectBlocks b <&> Piece.newSHA1 ) >>= return . ( == getHash ( h ^. hMeta ) ( b ^. Piece.hIndex ) )
+verifyPiece :: Handle -> Piece.Blocks -> IO Bool
+verifyPiece h b = ( Piece.collectBlocks b <&> newSHA1 ) >>= return . ( == getHash ( h ^. hMeta ) ( b ^. Piece.hIndex ) )
+
+verifyInfoHash :: Handle -> SHA1 -> Bool
+verifyInfoHash h = ( h ^. hMeta . mInfoHash == )
 
 processChan :: Handle -> IO ()
 processChan h = do
   ph@( Piece.Incomplete blocks ) <- readChan $ h ^. hChannel -- only incomplete pieces in Channel ( unsafe )
   let pi = blocks ^. Piece.hIndex
-  validHash <- verify h blocks
+  validHash <- verifyPiece h blocks
   when validHash $
     do modifyMVar_ ( h ^?! hBitfield . ix pi ) ( const $ return True )
        modifyMVar_ ( h ^. hDownloaded )        ( return . ( blocks ^. Piece.hSize + ) )
@@ -166,3 +185,4 @@ writePiecesUnsafe :: Handle -> IO ()
 writePiecesUnsafe h = do
   xs  <- getElems ( h ^. hPieces )
   B.writeFile ( h ^. hRoot ) $ B.concat [ x | Piece.Complete x <- xs ]
+

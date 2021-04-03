@@ -1,5 +1,5 @@
 -- | 
-{-# OPTIONS_GHC -fno-warn-unused-binds -fno-warn-name-shadowing -fno-warn-unused-matches #-}
+{-# OPTIONS_GHC -fno-warn-name-shadowing -fno-warn-unused-matches #-}
 {-# LANGUAGE OverloadedStrings, TemplateHaskell, RecordWildCards #-}
 
 module Piece where
@@ -10,11 +10,9 @@ import Data.Array.IO (IOArray)
 import Data.Array.MArray
 
 import qualified Data.ByteString as B
-import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Builder as BB
 import qualified Data.Attoparsec.ByteString as AP
 
-import qualified Crypto.Hash.SHA1 as SHA1
 
 import Lens.Micro.GHC (to, ix, (^.), (^?))
 import Lens.Micro.TH
@@ -27,17 +25,6 @@ import Base
 
 -------------
 
-newtype SHA1 = SHA1 { getSHA1 :: B.ByteString } deriving (Eq)
-
-instance Show SHA1 where
-  show = BS8.unpack . getSHA1
-
-newSHA1 :: B.ByteString -> SHA1
-newSHA1 = SHA1 . SHA1.hash
-
-clearIOArray :: IOArray Int e -> e -> IO ()
-clearIOArray arr val = void $ mapArray ( const val ) arr
-
 data Block = Block
   { _bIndex   :: BIndex
   , _bLength  :: BLength
@@ -46,16 +33,9 @@ data Block = Block
   } deriving (Show, Eq)
 
 $(makeLenses ''Block)
-
-instance Serialize Block where
-  decode = formatAP parseBlock
-  encode block = toStrictBS $ mconcat
-    [ block ^. bData . to B.length . to ( + 9 ) . to fromIntegral . to BB.int32BE
-    , BB.int32BE 7
-    , block ^. pIndex . to fromIntegral . to BB.int32BE
-    , block ^. bIndex . to fromIntegral . to BB.int32BE
-    , block ^. bData  . to BB.byteString
-    ]
+  
+newBlock :: BIndex -> BLength -> PIndex -> Block
+newBlock _bIndex _bLength _pIndex = Block { _bData = B.empty, .. }
 
 parseBlock :: AP.Parser Piece.Block
 parseBlock = do
@@ -65,9 +45,18 @@ parseBlock = do
     _bIndex  <- parseLengthPrefix
     _bData   <- AP.take ( _bLength - 9 )
     return $ Piece.Block{..}
-  
-newBlock :: BIndex -> BLength -> PIndex -> Block
-newBlock _bIndex _bLength _pIndex = Block { _bData = B.empty, .. }
+
+instance Serialize Block where
+  decode = parseBlock
+  encode block = toStrictBS $ mconcat
+    [ block ^. bData . to B.length . to ( + 9 ) . to fromIntegral . to BB.int32BE
+    , BB.int32BE 7
+    , block ^. pIndex . to fromIntegral . to BB.int32BE
+    , block ^. bIndex . to fromIntegral . to BB.int32BE
+    , block ^. bData  . to BB.byteString
+    ]
+   
+-------------
 
 data Blocks = Blocks
   { _hIndex       :: PIndex                  -- index of the piece within download
@@ -83,6 +72,8 @@ instance Show Blocks where
 
 collectBlocks :: Blocks -> IO B.ByteString
 collectBlocks h = B.pack <$> ( h ^. hBlocks . to getElems  )
+   
+-------------
 
 data Handle = Complete B.ByteString | Incomplete Blocks
 

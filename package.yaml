@@ -41,6 +41,8 @@ library:
   - stm
   - transformers
   - tuple
+  - http-client
+  - hashable
 
 executables:
   a-functional-torrent-client-exe:

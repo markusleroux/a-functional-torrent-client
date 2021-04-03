@@ -25,13 +25,13 @@ source-repository head
 
 library
   exposed-modules:
+      Base
       Bencode
       Client
       Download
       Lib
       Peer
       Piece
-      Types
   other-modules:
       Paths_a_functional_torrent_client
   hs-source-dirs:
@@ -44,6 +44,8 @@ library
     , bitwise
     , bytestring
     , cryptohash
+    , hashable
+    , http-client
     , microlens-ghc
     , microlens-th
     , network-simple

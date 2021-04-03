@@ -11,7 +11,6 @@ import qualified Data.Attoparsec.ByteString as AP
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Builder as BB
 import Data.ByteString.Lazy (toStrict)
-import Data.Array
 import Data.Maybe
 
 import Control.Monad (void)
@@ -45,7 +44,7 @@ $(makeLenses ''Config)
 
 data Handle = Handle
   { _hConfig       :: Config
-  , _hBFEi         :: Either DLength ( Array Int Bool )
+  , _hBFEi         :: Either DLength Bitfield
   , _hPeerState    :: IORef ConnectionState
   , _hClientState  :: IORef ConnectionState
   }
@@ -58,12 +57,12 @@ instance Show Handle where
 instance Eq Handle where
   (==) h o = h ^. hConfig . hID == o ^. hConfig . hID
 
-newFromConfig :: Either DLength ( Array Int Bool ) -> Config -> IO Peer.Handle
+newFromConfig :: Either DLength Bitfield -> Config -> IO Peer.Handle
 newFromConfig _hBFEi _hConfig = do
   [_hClientState, _hPeerState] <- sequence $ map newIORef $ replicate 2 $ ConnectionState True False
   return $ Handle{ .. }
 
-new :: IP -> Port -> ID -> Either DLength ( Array Int Bool ) -> IO Handle
+new :: IP -> Port -> ID -> Either DLength Bitfield -> IO Handle
 new _hIP _hPort _hID _hBFEi = newFromConfig _hBFEi $ Config { .. }
 
 flipChoked, flipInterested :: IORef ConnectionState -> IO ()
@@ -73,49 +72,49 @@ flipInterested = flip modifyIORef ( interested %~ not )
 ------ Handshake -------
 
 data Handshake = Handshake
-  { _pstr         :: String
-  , _hsInfoHash   :: Piece.SHA1
-  , _hsPeerID     :: Maybe ID
+  { _hsPstr       :: String
+  , _hsInfoHash   :: SHA1
+  , _hsID         :: Maybe ID
   } deriving (Show, Eq)
 
 $(makeLenses ''Handshake)
 
-parseHandshakePartOne :: AP.Parser Handshake
-parseHandshakePartOne = do
-  _pstr       <- int8Parser >>= Bencode.stringParser
-  _hsInfoHash <- Piece.SHA1 <$> ( AP.take 8 >> AP.take 20 )
-  return Handshake{ _hsPeerID = Nothing, .. }
+hsParserPartOne :: AP.Parser Handshake
+hsParserPartOne = do
+  _hsPstr       <- int8Parser >>= Bencode.stringParser
+  _hsInfoHash <- SHA1 <$> ( AP.take 8 >> AP.take 20 )
+  return Handshake{ _hsID = Nothing, .. }
   where
     int8Parser :: AP.Parser Int
     int8Parser = AP.take 1 >>= return . read . BS8.unpack
 
 instance Serialize Handshake where
   encode h
-    | h ^. hsPeerID . to isJust
-    = encode ( h & hsPeerID .~ Nothing ) <> ( h ^. hsPeerID . to fromJust . to BB.string8 . to BB.toLazyByteString . to toStrict )
+    | h ^. hsID . to isJust
+    = ( h ^. hsID . to fromJust . to BB.string8 . to BB.toLazyByteString . to toStrict ) <> encode ( h & hsID .~ Nothing )
     | otherwise
     = toStrictBS $ mconcat
-      [ h ^. pstr . to length . to fromIntegral . to BB.int32BE
-      , h ^. pstr . to BB.string8
+      [ h ^. hsPstr . to length . to fromIntegral . to BB.int32BE
+      , h ^. hsPstr . to BB.string8
       , BB.int64BE 0
-      , h ^. hsInfoHash . to Piece.getSHA1 . to BB.byteString
+      , h ^. hsInfoHash . to getSHA1 . to BB.byteString
       ]
       
-  decode = formatAP parseHandshakePartOne
+  decode = hsParserPartOne
 
-parseHandshakePartTwo :: Handshake -> AP.Parser Handshake
-parseHandshakePartTwo ph = Bencode.stringParser 20  >>= return . handshakeFromPartial ph
+receiveHSPartOne :: ( TCP.Socket, TCP.SockAddr ) -> MaybeT IO Handshake
+receiveHSPartOne = receiveTCP 1
+
+hsParserPartTwo :: Handshake -> AP.Parser Handshake
+hsParserPartTwo ph = Bencode.stringParser 20  >>= return . handshakeFromPartial ph
   where
     handshakeFromPartial :: Handshake -> ID -> Handshake
-    handshakeFromPartial = flip ( hsPeerID ?~ )
+    handshakeFromPartial = flip ( hsID ?~ )
 
-completeHandshake :: (TCP.Socket, TCP.SockAddr) -> Handshake -> MaybeT IO Handshake
-completeHandshake (sock, addr) hsp = do
-  pIDRaw <- MaybeT $ TCP.recv sock 2
-  MaybeT . return $ AP.parseOnly ( parseHandshakePartTwo hsp ) pIDRaw ^? _Right
-
-handshake :: ( TCP.Socket, TCP.SockAddr ) -> MaybeT IO Handshake
-handshake p = receiveTCPS p >>= ( completeHandshake p )
+-- handshake is typically sent in two parts, with ID coming after bitfield message
+-- this is probably not to be used
+decodeHandshake :: AP.Parser Handshake
+decodeHandshake = hsParserPartOne >>= hsParserPartTwo
 
 ------ General -------
 
@@ -214,5 +213,7 @@ newMsg ( PortMsg _port ) = toStrictBS $ lenPrefixMsg 3 <> idPrefixMsg 9 <> ( BB.
  
 instance Serialize Msg where
   encode = newMsg
-  decode = formatAP parseMsg
-  
+  decode = parseMsg
+
+---------------
+
