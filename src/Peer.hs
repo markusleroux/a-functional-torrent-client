@@ -15,13 +15,16 @@ import Data.Array
 import Data.Maybe
 
 import Control.Monad (void)
+import Control.Monad.Trans.Maybe
 
 import Lens.Micro.TH
-import Lens.Micro.GHC (to, (&), (<&>), (^.), (%~), (.~), (?~))
+import Lens.Micro.GHC (to, _Right, (&), (<&>), (^.), (^?), (%~), (.~), (?~))
+
+import qualified Network.Simple.TCP as TCP
 
 import qualified Piece
 import qualified Bencode
-import Types
+import Base
 
 ------- Handle --------
 
@@ -77,32 +80,42 @@ data Handshake = Handshake
 
 $(makeLenses ''Handshake)
 
+parseHandshakePartOne :: AP.Parser Handshake
+parseHandshakePartOne = do
+  _pstr       <- int8Parser >>= Bencode.stringParser
+  _hsInfoHash <- Piece.SHA1 <$> ( AP.take 8 >> AP.take 20 )
+  return Handshake{ _hsPeerID = Nothing, .. }
+  where
+    int8Parser :: AP.Parser Int
+    int8Parser = AP.take 1 >>= return . read . BS8.unpack
+
 instance Serialize Handshake where
   encode h
     | h ^. hsPeerID . to isJust
     = encode ( h & hsPeerID .~ Nothing ) <> ( h ^. hsPeerID . to fromJust . to BB.string8 . to BB.toLazyByteString . to toStrict )
     | otherwise
-    = toStrict . BB.toLazyByteString $ mconcat
+    = toStrictBS $ mconcat
       [ h ^. pstr . to length . to fromIntegral . to BB.int32BE
       , h ^. pstr . to BB.string8
       , BB.int64BE 0
       , h ^. hsInfoHash . to Piece.getSHA1 . to BB.byteString
       ]
-
-handshakeFromPartial :: Handshake -> String -> Handshake
-handshakeFromPartial = flip ( hsPeerID ?~ )
-
-parseHandshakePartOne :: AP.Parser Handshake
-parseHandshakePartOne = do
-  _pstr       <- int8Parser >>= Bencode.stringParser
-  _hsInfoHash <- Piece.SHA1 <$> ( AP.take 8 >> AP.take 20 )
-  return Handshake{ _hsPeerID = Nothing, ..}
-  where
-    int8Parser :: AP.Parser Int
-    int8Parser = AP.take 1 >>= return . read . BS8.unpack
+      
+  decode = formatAP parseHandshakePartOne
 
 parseHandshakePartTwo :: Handshake -> AP.Parser Handshake
 parseHandshakePartTwo ph = Bencode.stringParser 20  >>= return . handshakeFromPartial ph
+  where
+    handshakeFromPartial :: Handshake -> ID -> Handshake
+    handshakeFromPartial = flip ( hsPeerID ?~ )
+
+completeHandshake :: (TCP.Socket, TCP.SockAddr) -> Handshake -> MaybeT IO Handshake
+completeHandshake (sock, addr) hsp = do
+  pIDRaw <- MaybeT $ TCP.recv sock 2
+  MaybeT . return $ AP.parseOnly ( parseHandshakePartTwo hsp ) pIDRaw ^? _Right
+
+handshake :: ( TCP.Socket, TCP.SockAddr ) -> MaybeT IO Handshake
+handshake p = receiveTCPS p >>= ( completeHandshake p )
 
 ------ General -------
 
@@ -117,7 +130,7 @@ data Msg
   | RequestMsg          PIndex BIndex BLength 
   | PieceMsg            Piece.Block
   | CancelMsg           PIndex BIndex BLength
-  | PortMsg Int
+  | PortMsg Port
   deriving (Show, Eq)
 
 parseMsg :: AP.Parser Msg
@@ -135,11 +148,8 @@ parseMsg = AP.choice
   , parsePort
   ]
   where
-    parseLength :: AP.Parser Int
-    parseLength = AP.take 4 >>= ( return . read . BS8.unpack )
-
     parseFixedLength :: Int -> AP.Parser Int
-    parseFixedLength n = parseLength >>= ( \ l -> if n == l then fail "Length does not match expected length." else return l )
+    parseFixedLength n = parseLengthPrefix >>= ( \ l -> if n == l then fail "Length does not match expected length." else return l )
 
     parseKeepAlive :: AP.Parser Msg
     parseKeepAlive = parseFixedLength 0 >> return KeepAliveMsg
@@ -153,36 +163,56 @@ parseMsg = AP.choice
     parseUninterested = parseFixedLength 1 >> AP.word8 3 >> return UninterestedMsg
 
     parseHave :: AP.Parser Msg
-    parseHave = parseFixedLength 5 >> AP.word8 4 >> parseLength >>= return . HaveMsg
+    parseHave = parseFixedLength 5 >> AP.word8 4 >> parseInt32 >>= return . HaveMsg
 
     -- discard incorrectly sized bitfields (everywhere really)
     parseBitfield :: AP.Parser Msg
     parseBitfield = do
-      x <- parseLength
+      x <- parseInt32
       void $ AP.word8 5
       AP.take ( x - 1 ) <&> BitfieldMsg
 
     parseRequest :: AP.Parser Msg
     parseRequest = do
       void $ parseFixedLength 13 >> AP.word8 6
-      [i, b, l] <- sequence $ replicate 3 parseLength
+      [i, b, l] <- sequence $ replicate 3 parseInt32
       return $ RequestMsg i b l
 
     parsePiece :: AP.Parser Msg
-    parsePiece = do
-      _bLength  <- parseLength
-      void $ AP.word8 7
-      _pIndex <- parseLength
-      _bIndex <- parseLength
-      _bData  <- AP.take ( _bLength - 9 )
-      return $ PieceMsg Piece.Block{..}
+    parsePiece = fmap PieceMsg Piece.parseBlock
 
     parseCancel :: AP.Parser Msg
     parseCancel = do
       void $ parseFixedLength 13 >> AP.word8 8
-      [i, b, l] <- sequence $ replicate 3 parseLength
+      [i, b, l] <- sequence $ replicate 3 parseInt32
       return $ CancelMsg i b l
 
     parsePort :: AP.Parser Msg
     parsePort = parseFixedLength 3 >> AP.word8 9 >> AP.take 2 >>= ( return . PortMsg . read . BS8.unpack )
-    
+
+encodeInt32BE, lenPrefixMsg, idPrefixMsg :: Int -> BB.Builder
+encodeInt32BE  = BB.int32BE . fromIntegral
+lenPrefixMsg   = encodeInt32BE
+idPrefixMsg    = BB.int8    . fromIntegral
+
+newMsg :: Msg -> B.ByteString
+newMsg KeepAliveMsg        = toStrictBS $ lenPrefixMsg 0
+newMsg ChokeMsg            = toStrictBS $ lenPrefixMsg 1 <> idPrefixMsg 0
+newMsg UnchokeMsg          = toStrictBS $ lenPrefixMsg 1 <> idPrefixMsg 1
+newMsg InterestedMsg       = toStrictBS $ lenPrefixMsg 1 <> idPrefixMsg 2
+newMsg UninterestedMsg     = toStrictBS $ lenPrefixMsg 1 <> idPrefixMsg 3
+newMsg ( HaveMsg _pIndex ) = toStrictBS $ lenPrefixMsg 5 <> idPrefixMsg 4
+  <> encodeInt32BE _pIndex
+newMsg ( BitfieldMsg _bf ) = toStrictBS $ lenPrefixMsg ( 1 + B.length _bf ) <> idPrefixMsg 5
+  <> BB.byteString _bf
+newMsg ( RequestMsg _pIndex _bIndex _bLen ) = toStrictBS $ lenPrefixMsg 13 <> idPrefixMsg 6
+  <> encodeInt32BE _pIndex <> encodeInt32BE _bIndex <> encodeInt32BE _bLen
+newMsg ( PieceMsg _block ) = encode _block
+newMsg ( CancelMsg _pIndex _bIndex _bLen )  = toStrictBS $ lenPrefixMsg 13 <> idPrefixMsg 8
+  <> encodeInt32BE _pIndex <> encodeInt32BE _bIndex <> encodeInt32BE _bLen
+newMsg ( PortMsg _port ) = toStrictBS $ lenPrefixMsg 3 <> idPrefixMsg 9 <> ( BB.int16BE . fromIntegral $ _port )
+ 
+instance Serialize Msg where
+  encode = newMsg
+  decode = formatAP parseMsg
+  

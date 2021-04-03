@@ -5,26 +5,25 @@
 module Piece where
 
 import Data.Word 
-import Data.Bits
-import Data.Array (Array, listArray, elems)
+import Data.Array (elems)
 import Data.Array.IO (IOArray)
 import Data.Array.MArray
-import Data.Bits.Bitwise (toListBE)
 
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Builder as BB
+import qualified Data.Attoparsec.ByteString as AP
 
 import qualified Crypto.Hash.SHA1 as SHA1
 
-import Lens.Micro.GHC (to, ix, strict, (^.), (^?), (&))
+import Lens.Micro.GHC (to, ix, (^.), (^?))
 import Lens.Micro.TH
 
 import Control.Monad
 import Control.Concurrent.Chan
 import Control.Concurrent.MVar
 
-import Types
+import Base
 
 -------------
 
@@ -35,33 +34,6 @@ instance Show SHA1 where
 
 newSHA1 :: B.ByteString -> SHA1
 newSHA1 = SHA1 . SHA1.hash
-
-newBitfield :: Length -> IO Bitfield
-newBitfield n = listArray (0, n) <$> replicateM n newEmptyMVar
-
-newBitfieldBS :: B.ByteString -> Array Int Bool
-newBitfieldBS bs = let bl = concatMap toListBE $ B.unpack bs in
-  listArray (0, length bl - 1) bl
-
--- does this work?
-clearBitfield :: Bitfield -> IO ()
-clearBitfield = sequence_ . fmap clearBit
-  where
-    clearBit :: MVar Bool -> IO ()
-    clearBit bMVar = void $ swapMVar bMVar False
-
-encodeBF :: Bitfield -> IO B.ByteString
-encodeBF arr = do
-  bs <- sequence . map readMVar . elems $ arr
-  [ BB.int32BE . fromIntegral $ length arr + 1
-    , BB.int8 5
-    , encodeBools bs 0
-    ] & return . ( ^. strict ) . BB.toLazyByteString . mconcat
-  where
-    encodeBools :: [Bool] -> Index -> BB.Builder
-    encodeBools [] i = mempty
-    encodeBools bs i = let (eight, rest) = splitAt 8 bs in
-      ( BB.word8 . foldl (.|.) zeroBits . fmap bit . filter ( eight !! ) $ [0..8] ) <> encodeBools rest 8
 
 clearIOArray :: IOArray Int e -> e -> IO ()
 clearIOArray arr val = void $ mapArray ( const val ) arr
@@ -76,14 +48,24 @@ data Block = Block
 $(makeLenses ''Block)
 
 instance Serialize Block where
-  encode b = ( ^. strict ) . BB.toLazyByteString . mconcat $
-    [ b ^. bData . to B.length . to ( + 9 ) . to fromIntegral . to BB.int32BE
+  decode = formatAP parseBlock
+  encode block = toStrictBS $ mconcat
+    [ block ^. bData . to B.length . to ( + 9 ) . to fromIntegral . to BB.int32BE
     , BB.int32BE 7
-    , b ^. pIndex . to fromIntegral . to BB.int32BE
-    , b ^. bIndex . to fromIntegral . to BB.int32BE
-    , b ^. bData  . to BB.byteString
+    , block ^. pIndex . to fromIntegral . to BB.int32BE
+    , block ^. bIndex . to fromIntegral . to BB.int32BE
+    , block ^. bData  . to BB.byteString
     ]
 
+parseBlock :: AP.Parser Piece.Block
+parseBlock = do
+    _bLength <- parseLengthPrefix
+    void $ AP.word8 7
+    _pIndex  <- parseLengthPrefix
+    _bIndex  <- parseLengthPrefix
+    _bData   <- AP.take ( _bLength - 9 )
+    return $ Piece.Block{..}
+  
 newBlock :: BIndex -> BLength -> PIndex -> Block
 newBlock _bIndex _bLength _pIndex = Block { _bData = B.empty, .. }
 
@@ -91,7 +73,7 @@ data Blocks = Blocks
   { _hIndex       :: PIndex                  -- index of the piece within download
   , _hSize        :: PLength                -- size of the piece in bytes
   , _hBlocks      :: IOArray Int Word8      -- array of data (update only after write to _pieceBitfield)
-  , _hBitfield    :: Bitfield               -- indicate if data has been written
+  , _hBitfield    :: MVarBitfield               -- indicate if data has been written
   } deriving (Eq)
 
 $(makeLenses ''Blocks)
@@ -107,7 +89,7 @@ data Handle = Complete B.ByteString | Incomplete Blocks
 new :: Index -> PLength -> IO Handle
 new _hIndex _hSize =
   do _hBlocks   <- newListArray (0, _hSize) [ 0 | _ <- [0.._hSize]]
-     _hBitfield <- newBitfield _hSize
+     _hBitfield <- newMVarBF _hSize
      return $ Incomplete Blocks{..}
 
 complete :: Handle -> IO Handle

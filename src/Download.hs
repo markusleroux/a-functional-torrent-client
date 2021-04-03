@@ -14,9 +14,9 @@ import qualified Data.HashMap.Strict as HM
 import qualified Data.Attoparsec.ByteString as AP
 import Data.Either (isLeft)
 
+import Control.Monad
 import Control.Concurrent.Chan
 import Control.Concurrent.MVar
-import Control.Monad
 
 import Lens.Micro.TH
 import Lens.Micro.GHC (to, ix, (^.), (^?!), (&), (<&>), (?~), (.~))
@@ -24,21 +24,21 @@ import Lens.Micro.GHC (to, ix, (^.), (^?!), (&), (<&>), (?~), (.~))
 import qualified Piece
 import qualified Peer
 import qualified Bencode
-import Types
+import Base
 
 ---------------
 
 data MetaInfo = Meta
-  { _announce     :: String            -- the URL of the tracker
-  , _infoHash     :: Piece.SHA1              -- a hash of info dictionary
-  , _info         :: TorrentInfo       -- a dictionary describing the torrent
+  { _mAnnounce     :: String            -- the URL of the tracker
+  , _mInfoHash     :: Piece.SHA1              -- a hash of info dictionary
+  , _mInfo         :: TorrentInfo       -- a dictionary describing the torrent
   } deriving (Show, Eq)
 
 data TorrentInfo = TorrentInfo
-  { _name            :: Maybe String    -- the suggested name for the file/directory
-  , _piecesLength    :: PLength         -- the number of bytes in each piece of the torrent
-  , _pieces          :: Piece.SHA1            -- SHA1 hashes of the pieces
-  , _length          :: DLength         -- length of the file in bytes (could also be files key for multi-file torrent)
+  { _tName            :: Maybe String    -- the suggested name for the file/directory
+  , _tPLen            :: PLength         -- the number of bytes in each piece of the torrent
+  , _tPHash           :: Piece.SHA1            -- SHA1 hashes of the pieces
+  , _tDLen            :: DLength         -- length of the file in bytes (could also be files key for multi-file torrent)
   } deriving (Show, Eq)
 
 $(makeLenses ''MetaInfo)
@@ -47,33 +47,29 @@ $(makeLenses ''TorrentInfo)
 promptName :: TorrentInfo -> IO TorrentInfo
 promptName t = do
   nm <- putStrLn "Please name the torrent." >> getLine
-  return $ t & name ?~ nm
+  return $ t & tName ?~ nm
 
 getHash :: MetaInfo -> PIndex -> Piece.SHA1
 getHash meta pIndex =
   let startIndex = 20 * pIndex
       endIndex = startIndex + 20 in
-  Piece.SHA1 $ takeIn startIndex endIndex $ ( Piece.getSHA1 $ meta ^. info . pieces )
+  Piece.SHA1 $ takeIn startIndex endIndex $ ( Piece.getSHA1 $ meta ^. mInfo . tPHash )
   where
     takeIn :: Index -> Index -> B.ByteString -> B.ByteString
     takeIn start end = B.take end . B.drop start
 
 data TrackerResponse = TrackerResponse
-  { _interval         :: Int
-  , _trackerID        :: String
-  , _complete         :: Int
-  , _incomplete       :: Int
-  , _peers            :: Either [Peer.Config] [Peer.Handle]
+  { _trInterval         :: Int
+  , _trID               :: String
+  , _trComplete         :: Int
+  , _trIncomplete       :: Int
+  , _trPeers            :: Either [Peer.Config] [Peer.Handle]
   } deriving (Eq)
 
 $(makeLenses ''TrackerResponse)
 
-initPeers :: MetaInfo -> TrackerResponse -> IO TrackerResponse
-initPeers meta tr
-  | tr ^. peers . to isLeft = let Left pLeft = tr ^. peers in
-    do ps <- sequence $ map ( meta ^. info . length . to Left . to Peer.newFromConfig ) pLeft
-       return $ tr & peers .~ Right ps
-  | otherwise = return tr
+newTrackerResponse :: Int -> ID -> Int -> Int -> [Peer.Config] -> TrackerResponse
+newTrackerResponse _trInterval _trID _trComplete _trIncomplete _trPeers = TrackerResponse{ _trPeers = Left _trPeers, .. }
 
 parseTrackerResponse :: AP.Parser TrackerResponse
 parseTrackerResponse = do
@@ -85,7 +81,7 @@ parseTrackerResponse = do
                , d HM.!? "incomplete"  >>= Bencode.intMb
                , d HM.!? "peers"       >>= getPeers
                )
-    of Just (_interval, _trackerID, _complete, _incomplete, _peers)
+    of Just (_trInterval, _trID, _trComplete, _trIncomplete, _trPeers)
          -> return TrackerResponse{ .. }
        Nothing
          -> fail "Failed to find key in tracker response dictionary."
@@ -101,6 +97,17 @@ parseTrackerResponse = do
       _hPort <- d HM.!? "port"    >>= Bencode.intMb
       return Peer.Config{ .. }
 
+instance Serialize TrackerResponse where
+  encode = undefined
+  decode = formatAP parseTrackerResponse
+
+initPeers :: MetaInfo -> TrackerResponse -> IO TrackerResponse
+initPeers meta tr
+  | tr ^. trPeers . to isLeft = let Left pLeft = tr ^. trPeers in
+    do ps <- sequence $ map ( meta ^. mInfo . tDLen . to Left . to Peer.newFromConfig ) pLeft
+       return $ tr & trPeers .~ Right ps
+  | otherwise = return tr
+
 data Handle = Handle
   { _hMeta               :: MetaInfo
   , _hDownloaded         :: MVar Int
@@ -108,7 +115,7 @@ data Handle = Handle
   , _hTrackerResponse    :: TrackerResponse
   , _hPieces             :: IOArray PIndex Piece.Handle
   , _hChannel            :: Chan Piece.Handle
-  , _hBitfield           :: Bitfield
+  , _hBitfield           :: MVarBitfield
   , _hRoot               :: FilePath
   } deriving (Eq)
   
@@ -117,21 +124,23 @@ $(makeLenses ''Handle)
 new :: MetaInfo -> TrackerResponse -> FilePath -> IO Handle
 new _hMeta _hTrackerResponse _hRoot =
   let
-    l = ceilDiv ( _hMeta ^. info . length ) ( _hMeta ^. info . piecesLength )
-  in do
-    _hPieces     <- MA.newListArray (0, l)
-                     =<< sequence [ _hMeta ^. info . piecesLength . to ( Piece.new i ) | i <- [0..l] ]
-    _hBitfield   <- Piece.newBitfield l          
-    _hDownloaded <- newMVar 0
-    _hUploaded   <- newMVar 0
-    _hChannel    <- newChan
-    return Handle{..}
+    l = ceilDiv ( _hMeta ^. mInfo . tDLen ) ( _hMeta ^. mInfo . tPLen )
+    pieces = MA.newListArray (0, l) =<< sequence [ _hMeta ^. mInfo . tPLen . to ( Piece.new i ) | i <- [0..l] ]
+    _hBitfield = newMVarBF l
+  in Handle _hMeta
+     <$> newMVar 0
+     <*> newMVar 0
+     <*> return _hTrackerResponse
+     <*> pieces
+     <*> newChan
+     <*> _hBitfield
+     <*> return _hRoot
   where
     ceilDiv :: Int -> Int -> Int
     ceilDiv a b = -div ( -a ) b
 
 getPath :: Handle -> Maybe FilePath
-getPath h = ( h ^. hRoot ++ ) <$> h ^. hMeta . info . name
+getPath h = ( h ^. hRoot ++ ) <$> h ^. hMeta . mInfo . tName
 
 writeBlock :: Handle -> Piece.Block -> IO ()
 writeBlock h b =

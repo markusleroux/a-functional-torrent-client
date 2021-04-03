@@ -1,6 +1,6 @@
 -- |
 {-# OPTIONS_GHC -fno-warn-unused-binds -fno-warn-name-shadowing -fno-warn-unused-matches #-}
-{-# LANGUAGE OverloadedStrings, DataKinds, TemplateHaskell #-}
+{-# LANGUAGE OverloadedStrings, DataKinds, TemplateHaskell, RecordWildCards #-}
 
 module Client where
 
@@ -39,8 +39,8 @@ $(makeLenses ''Config)
 $(makeLenses ''Handle)
 
 new :: Config -> Handle
-new c = Handle { _hConfig = c, _hDownloads = HM.empty }
-
+new _hConfig = Handle { _hDownloads = HM.empty, .. }
+ 
 trackerRequest :: Req.MonadHttp m => Handle -> Down.Handle -> IO ( m Req.BsResponse )
 trackerRequest client d = do
   down  <- readMVar $ d ^. Down.hDownloaded
@@ -48,19 +48,19 @@ trackerRequest client d = do
   return $ Req.req Req.GET url Req.NoReqBody Req.bsResponse $ options down up
   where
     url :: Req.Url 'Req.Http
-    url = Req.http $ T.pack $ d ^. Down.hMeta . Down.announce
+    url = Req.http $ T.pack $ d ^. Down.hMeta . Down.mAnnounce
 
     options :: Int -> Int -> Req.Option 'Req.Http
     options down up = mconcat $
-      [ "info_hash="      Req.=: ( show   $ d ^. Down.hMeta . Down.infoHash )
+      [ "info_hash="      Req.=: ( show   $ d ^. Down.hMeta . Down.mInfoHash )
       , "peer_id"         Req.=: ( T.pack $ client ^. hConfig . cID )
       , "port="           Req.=: ( T.pack $ show $ client ^. hConfig . cPort )
       , "uploaded="       Req.=: ( T.pack $ show $ up )
       , "downloaded="     Req.=: ( T.pack $ show $ down )
-      , "left="           Req.=: ( T.pack $ show $ d ^. Down.hMeta . Down.info . Down.length - down )
+      , "left="           Req.=: ( T.pack $ show $ d ^. Down.hMeta . Down.mInfo . Down.tDLen - down )
       , "compact="        Req.=: ( T.pack "0" )
       , "no_peer_id="     Req.=: ( T.pack "0" )
       ]
- 
+
 clientServer :: MonadIO m => Handle -> ((TCP.Socket, TCP.SockAddr) -> IO ()) -> m a
 clientServer client = TCP.serve TCP.HostAny ( show $ client ^. hConfig . cPort )
