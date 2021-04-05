@@ -101,3 +101,4 @@ writeBlock h@( Incomplete piece ) chan block = do
              addBlock ( B.tail b ) ( i + 1 ) ( l - 1 )
       | otherwise = return ()
 writeBlock _ _ _  = return ()
+

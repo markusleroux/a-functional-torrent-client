@@ -30,6 +30,7 @@ library:
   - attoparsec
   - microlens-ghc
   - microlens-th
+  - microlens-platform
   - unordered-containers
   - utf8-string
   - binary
@@ -43,6 +44,7 @@ library:
   - tuple
   - http-client
   - hashable
+  - mtl
 
 executables:
   a-functional-torrent-client-exe:

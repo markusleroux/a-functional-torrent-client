@@ -47,7 +47,9 @@ library
     , hashable
     , http-client
     , microlens-ghc
+    , microlens-platform
     , microlens-th
+    , mtl
     , network-simple
     , req
     , stm
