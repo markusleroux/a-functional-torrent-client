@@ -20,7 +20,7 @@ import Control.Concurrent.Chan
 import Control.Concurrent.MVar
 
 import Lens.Micro.TH
-import Lens.Micro.GHC (to, ix, (^.), (^?!), (&), (<&>), (?~), (.~))
+import Lens.Micro.Platform (to, ix, (^.), (^?!), (&), (<&>), (?~), (.~))
 
 import qualified Piece
 import qualified Peer
@@ -55,7 +55,7 @@ getHash meta pIndex =
   let startIndex = 20 * pIndex
       endIndex = startIndex + 20
   in
-    SHA1 $ takeIn startIndex endIndex $ ( getSHA1 $ meta ^. mInfo . tPHash )
+    SHA1 $ takeIn startIndex endIndex $ getSHA1 $ meta ^. mInfo . tPHash
   where
     takeIn :: Index -> Index -> B.ByteString -> B.ByteString
     takeIn start end = B.take end . B.drop start
@@ -70,8 +70,8 @@ data TrackerResponse = TrackerResponse
 
 $(makeLenses ''TrackerResponse)
 
-hasPeerID :: TrackerResponse -> ID -> Bool
-hasPeerID tr id = either mapConfig mapHandle $ tr ^. trPeers
+trHasPeerID :: TrackerResponse -> ID -> Bool
+trHasPeerID tr id = either mapConfig mapHandle $ tr ^. trPeers
   where
     hasID :: [ID] -> Bool
     hasID = elem id
@@ -85,8 +85,8 @@ hasPeerID tr id = either mapConfig mapHandle $ tr ^. trPeers
 newTrackerResponse :: Int -> ID -> Int -> Int -> [Peer.Config] -> TrackerResponse
 newTrackerResponse _trInterval _trID _trComplete _trIncomplete _trPeers = TrackerResponse{ _trPeers = Left _trPeers, .. }
 
-parseTrackerResponse :: AP.Parser TrackerResponse
-parseTrackerResponse = do
+_decodeTR :: AP.Parser TrackerResponse
+_decodeTR = do
   d <- Bencode.dictionaryParser
   case
     sequenceT  ( d HM.!? "interval"    >>= Bencode.intMb
@@ -115,18 +115,18 @@ parseTrackerResponse = do
 
 instance Serialize TrackerResponse where
   encode = undefined
-  decode = parseTrackerResponse
+  decode = _decodeTR
 
 initPeers :: MetaInfo -> TrackerResponse -> IO TrackerResponse
 initPeers meta tr
   | tr ^. trPeers . to isLeft = do
-      ps <- finishPeersList ( meta ^. mInfo . tDLen ) $ tr ^. trPeers
+      ps <- finishPeersList ( meta ^. mInfoHash ) $ tr ^. trPeers
       return $ tr & trPeers .~ Right ps
   | otherwise = return tr
  
-finishPeersList :: Length -> Either [Peer.Config] [Peer.Handle] -> IO [Peer.Handle]
-finishPeersList l ( Left peers ) = sequence $ map Peer.newFromConfig peers
-finishPeersList _ ( Right peers ) = return peers
+finishPeersList :: SHA1 -> Either [Peer.Config] [Peer.Handle] -> IO [Peer.Handle]
+finishPeersList _infoHash ( Left peers ) = sequence $ map ( flip Peer.newFromConfig _infoHash ) peers
+finishPeersList _infoHash ( Right peers ) = return peers
 
 data Handle = Handle
   { _hMeta               :: MetaInfo

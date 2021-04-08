@@ -15,7 +15,7 @@ import Control.Monad (void)
 import Control.Monad.Trans.Maybe
 
 import Lens.Micro.TH
-import Lens.Micro.GHC (to, (&), (<&>), (^.), (.~), (?~))
+import Lens.Micro.Platform (to, (&), (<&>), (^.), (.~), (?~))
 
 import qualified Network.Simple.TCP as TCP
 
@@ -29,12 +29,14 @@ data Config = Config
   { _cIP        :: IP
   , _cPort      :: Port
   , _cID        :: Maybe ID
-  , _cInfoHash  :: SHA1
   } deriving (Show, Eq)
 
 $(makeLenses ''Config)
 
-data Handle = Handle { _hConfig       :: Config }
+data Handle = Handle
+  { _hConfig    :: Config
+  , _hInfoHash  :: SHA1
+  }
 
 $(makeLenses ''Handle)
 
@@ -51,14 +53,11 @@ instance Show Handle where
 instance Eq Handle where
   (==) h o = h ^. hConfig . cID == o ^. hConfig . cID
 
-newFromConfig :: Config -> IO Peer.Handle
-newFromConfig _hConfig = do
-  -- compute the connection from the tcp sock
-  let _hConnection = undefined
-  return $ Handle{ .. }
+newFromConfig :: Config -> SHA1 -> IO Peer.Handle
+newFromConfig _hConfig _hInfoHash = return $ Handle{ .. }
 
 new :: IP -> Port -> Maybe ID -> SHA1 -> IO Handle
-new _cIP _cPort _cID _cInfoHash = newFromConfig Config { .. }
+new _cIP _cPort _cID _cInfoHash = newFromConfig Config { .. } _cInfoHash
 
 ------ Handshake -------
 

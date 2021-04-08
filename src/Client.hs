@@ -13,11 +13,11 @@ import Data.IORef
 
 import Control.Monad (void)
 import Control.Monad.IO.Class
-import Control.Concurrent.MVar
 import Control.Monad.Trans.Maybe
 import Control.Monad.Trans.Reader
+import Control.Concurrent.MVar
 
-import Lens.Micro.GHC (to, (^.))
+import Lens.Micro.Platform (to, ix, (^.), (^?))
 import Lens.Micro.TH
 
 import qualified Network.Simple.TCP as TCP
@@ -76,24 +76,26 @@ trackerRequest client d = do
       ]
 
 hsToDownloadMb :: Handle -> Peer.Handshake -> Maybe Down.Handle       -- returns Nothing if hash is not in downloads
-hsToDownloadMb client peerHSP1 = ( client ^. hDownloads ) HM.!? ( peerHSP1 ^. Peer.hsInfoHash )
+hsToDownloadMb client peerHSP1 = client ^? hDownloads . ix ( peerHSP1 ^. Peer.hsInfoHash )
 
 peerToDownloadMb :: Handle -> Peer.Handle -> Maybe Down.Handle
-peerToDownloadMb client peer = ( client ^. hDownloads ) HM.!? ( peer ^. Peer.hConfig . Peer.cInfoHash )
+peerToDownloadMb client peer = client ^? hDownloads . ix ( peer ^. Peer.hInfoHash )
 
 data InitialData = InitialData
   { _pStateInit  :: IORef ConnectionState
   , _cStateInit  :: IORef ConnectionState
-  , _down        :: Down.Handle
+  , _cInfoHash   :: SHA1
   }
 
 $(makeLenses ''InitialData)
 
 getInitialDataFromTorrent :: Down.Handle -> MaybeT IO InitialData
-getInitialDataFromTorrent _down = do
-  [_pStateInit, _cStateInit] <- liftIO $ sequence . replicate 2 $ newIORef $ ConnectionState{ _choking = False, _interested = True }
-  return InitialData{..}
+getInitialDataFromTorrent _down = let _cInfoHash = _down ^. Down.hMeta . Down.mInfoHash in
+  do
+    [_pStateInit, _cStateInit] <- liftIO $ sequence . replicate 2 $ newIORef $ ConnectionState{ _choking = False, _interested = True }
+    return InitialData{..}
 
+-- fail if InfoHash of client does not match to known download
 getInitialDataFromHS :: Handle -> MaybeT IO Peer.Handshake -> MaybeT IO InitialData
 getInitialDataFromHS client hsMbT = do
   hs <- hsMbT
@@ -104,8 +106,10 @@ getInitialDataFromHS client hsMbT = do
 receiveHS :: Handle -> ReaderT ( TCP.Socket, TCP.SockAddr ) ( MaybeT IO ) InitialData
 receiveHS client = mapReaderT ( getInitialDataFromHS client ) $ ReaderT Peer._receiveHSPart1
 
-sendHS :: InitialData -> ReaderT ( TCP.Socket, TCP.SockAddr ) ( MaybeT IO ) InitialData
-sendHS iData@(InitialData{ .. }) = ReaderT $ \ (sock, addr) -> do
+sendHS :: Handle -> InitialData -> ReaderT ( TCP.Socket, TCP.SockAddr ) ( MaybeT IO ) InitialData
+sendHS client iData@(InitialData{ .. }) = let _downMb = client ^? hDownloads . ix _cInfoHash in
+  ReaderT $ \ (sock, addr) -> do
+    _down <- MaybeT . return $ _downMb
     TCP.send sock . encode $
       Peer.Handshake { _hsID       = Nothing
                      , _hsPstr     = "BitTorrent Protocol"
@@ -113,17 +117,18 @@ sendHS iData@(InitialData{ .. }) = ReaderT $ \ (sock, addr) -> do
                      }
     return iData
 
-initConnectionData :: MaybeT IO InitialData -> MaybeT IO ConnectionData
-initConnectionData = fmap initConnectionData'
+initConnectionData :: Handle -> MaybeT IO InitialData -> MaybeT IO ConnectionData
+initConnectionData client = ( >>= initConnectionData' )
   where
-    initConnectionData' :: InitialData -> ConnectionData
-    initConnectionData' iData@(InitialData{ _pStateInit = _pState, _cStateInit = _cState, .. }) =
+    initConnectionData' :: InitialData -> MaybeT IO ConnectionData
+    initConnectionData' iData@(InitialData{ _pStateInit = _pState, _cStateInit = _cState, .. }) = do
+      _down <- MaybeT . return $ client ^? hDownloads . ix _cInfoHash
       let dLen = _down ^. Down.hMeta . Down.mInfo . Down.tDLen
-      in ConnectionData{ _bitfield = newBF dLen, .. }
+      return ConnectionData{ _bitfield = newBF dLen, .. }
 
-initConnectionDataReader ::  ReaderT ( TCP.Socket, TCP.SockAddr ) ( MaybeT IO ) InitialData
-  ->  ReaderT ( TCP.Socket, TCP.SockAddr ) ( MaybeT IO ) ConnectionData
-initConnectionDataReader = mapReaderT initConnectionData
+initConnectionDataReader :: Handle -> ReaderT ( TCP.Socket, TCP.SockAddr ) ( MaybeT IO ) InitialData
+                                   -> ReaderT ( TCP.Socket, TCP.SockAddr ) ( MaybeT IO ) ConnectionData
+initConnectionDataReader client = mapReaderT $ initConnectionData client
 
 serve :: ConnectionData -> ReaderT ( TCP.Socket, TCP.SockAddr ) ( MaybeT IO ) ()
 serve = undefined
@@ -131,10 +136,15 @@ serve = undefined
 ----- Incoming ------
 
 initServer :: Handle -> IO ()
-initServer client = let clientPort = client ^. hConfig . cPort . to show
+initServer client =
+  let
+    clientPort = client ^. hConfig . cPort . to show
+    receiveHS' = receiveHS client
+    sendHS'    = sendHS client
+    initConnectionDataReader' = initConnectionDataReader client
   in
     TCP.serve TCP.HostAny clientPort
-      $ void . runMaybeT . runReaderT ( ( receiveHS client >>= sendHS ) ^. to initConnectionDataReader >>= serve )
+      $ void . runMaybeT . runReaderT ( ( receiveHS' >>= sendHS' ) ^. to initConnectionDataReader' >>= serve )
 
 ----- Outgoing ------
 
@@ -148,20 +158,19 @@ connect client peer =
     TCP.connect pIP pPort $ void . runMaybeT . runReaderT connection
   where
     down = undefined
+    receiveHSWrapped = initConnectionDataReader client $ receiveHS client
     
-    initFromTorrentWrapped :: Handle -> Down.Handle -> ReaderT ( TCP.Socket, TCP.SockAddr ) ( MaybeT IO ) InitialData
-    initFromTorrentWrapped client down = ReaderT . const $ getInitialDataFromTorrent down
-
-    receiveHSWrapped = initConnectionDataReader $ ( receiveHS client ) 
+    initFromTorrentWrapped :: Down.Handle -> ReaderT ( TCP.Socket, TCP.SockAddr ) ( MaybeT IO ) InitialData
+    initFromTorrentWrapped down = ReaderT . const $ getInitialDataFromTorrent down
 
     -- improve receiveHSWrapped to avoid throwing away and recreating
     -- and to get _down from monad
     connection :: ReaderT ( TCP.Socket, TCP.SockAddr ) ( MaybeT IO ) ()
-    connection = initFromTorrentWrapped client down >>= sendHS >> receiveHSWrapped >>= serve >> return ()
+    connection = initFromTorrentWrapped down >>= sendHS client >> receiveHSWrapped >>= serve >> return ()
 
 
 contactPeers :: Handle -> SHA1 -> IO ()
-contactPeers client infoHash = let downMb = ( client ^. hDownloads ) HM.!? infoHash
+contactPeers client infoHash = let downMb = client ^? hDownloads . ix infoHash
   in maybe ( return () ) contactPeers' downMb
   where
     contactPeers' :: Down.Handle -> IO ()
@@ -170,5 +179,5 @@ contactPeers client infoHash = let downMb = ( client ^. hDownloads ) HM.!? infoH
         downLen = down ^. Down.hMeta . Down.mInfo . Down.tDLen
         peersEi   = down ^. Down.hTrackerResponse . Down.trPeers
       in do
-        peers <- Down.finishPeersList downLen peersEi
+        peers <- Down.finishPeersList infoHash peersEi
         sequence_ $ connect client <$> peers

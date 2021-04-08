@@ -8,7 +8,7 @@ import qualified Data.ByteString.Char8 as BS8
 import qualified Data.Attoparsec.ByteString as AP
 import Data.Attoparsec.ByteString.Char8 (char, signed, decimal)
 
-import Lens.Micro.GHC ((<&>))
+import Lens.Micro.Platform ((<&>))
 
 ------------------
 

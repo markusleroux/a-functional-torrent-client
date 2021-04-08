@@ -25,26 +25,24 @@ dependencies:
 library:
   source-dirs: src
   dependencies:
+  - attoparsec
   - bytestring
   - text
-  - attoparsec
-  - microlens-ghc
-  - microlens-th
-  - microlens-platform
-  - unordered-containers
   - utf8-string
   - binary
-  - req
-  - cryptohash
-  - network-simple
-  - array
   - bitwise
+  - array
+  - tuple
+  - unordered-containers
+  - microlens-th
+  - microlens-platform
+  - req
+  - http-client
+  - network-simple
+  - cryptohash
+  - hashable
   - stm
   - transformers
-  - tuple
-  - http-client
-  - hashable
-  - mtl
 
 executables:
   a-functional-torrent-client-exe:

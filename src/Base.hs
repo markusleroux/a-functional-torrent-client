@@ -21,7 +21,7 @@ import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BS8
 import Data.ByteString.Lazy (toStrict)
 
-import Lens.Micro.GHC (_Right, to, (^?), (%~))
+import Lens.Micro.Platform (_Right, to, (^?), (%~))
 import Lens.Micro.TH
 
 import qualified Network.Simple.TCP as TCP

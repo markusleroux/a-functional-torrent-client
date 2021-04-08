@@ -13,8 +13,7 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Builder as BB
 import qualified Data.Attoparsec.ByteString as AP
 
-
-import Lens.Micro.GHC (to, ix, (^.), (^?))
+import Lens.Micro.Platform (to, ix, (^.), (^?))
 import Lens.Micro.TH
 
 import Control.Monad
