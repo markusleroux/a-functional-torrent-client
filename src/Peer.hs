@@ -13,29 +13,26 @@ import Data.Maybe
 
 import Control.Monad (void)
 import Control.Monad.Trans.Maybe
+import Control.Monad.Trans.Reader
+import Control.Monad.IO.Class
 
 import Lens.Micro.TH
 import Lens.Micro.Platform (to, (&), (<&>), (^.), (.~), (?~))
 
 import qualified Network.Simple.TCP as TCP
 
+import Base
+import Connection
 import qualified Piece
 import qualified Bencode
-import Base
 
 ------- Handle --------
 
-data Config = Config
+data Handle = Handle
   { _cIP        :: IP
   , _cPort      :: Port
   , _cID        :: Maybe ID
-  } deriving (Show, Eq)
-
-$(makeLenses ''Config)
-
-data Handle = Handle
-  { _hConfig    :: Config
-  , _hInfoHash  :: SHA1
+  , _hInfoHash  :: Either SHA1 SHA1
   }
 
 $(makeLenses ''Handle)
@@ -43,22 +40,18 @@ $(makeLenses ''Handle)
 instance Show Handle where
   show h =
     let
-      config = h ^. hConfig
-      id     = config ^. cID . to show
-      ip     = config ^. cIP
-      port   = config ^. cPort . to show
+      id     = h ^. cID . to show
+      ip     = h ^. cIP
+      port   = h ^. cPort . to show
     in
       concat [ "Peer ", id, "( ", ip, port, " )"]
 
 instance Eq Handle where
-  (==) h o = h ^. hConfig . cID == o ^. hConfig . cID
+  (==) peer other = peer ^. cID == peer ^. cID
 
-newFromConfig :: Config -> SHA1 -> IO Peer.Handle
-newFromConfig _hConfig _hInfoHash = return $ Handle{ .. }
-
-new :: IP -> Port -> Maybe ID -> SHA1 -> IO Handle
-new _cIP _cPort _cID _cInfoHash = newFromConfig Config { .. } _cInfoHash
-
+new :: IP -> Port -> Maybe ID -> SHA1 -> Handle
+new _cIP _cPort _cID _hInfoHashTR = Handle { _hInfoHash = Left _hInfoHashTR, .. }
+  
 ------ Handshake -------
 
 data Handshake = Handshake
@@ -105,7 +98,7 @@ _encodeHS h
       , h ^. hsInfoHash . to getSHA1 . to BB.byteString
       ]
 
-_receiveHSPart1 :: ( TCP.Socket, TCP.SockAddr ) -> MaybeT IO Handshake
+_receiveHSPart1 :: ReaderT ( TCP.Socket, TCP.SockAddr ) ( MaybeT IO ) Handshake
 _receiveHSPart1 = let prefixLen = 1 in receiveTCP prefixLen
 
 ------ General -------
@@ -181,9 +174,9 @@ _decodeMsg = AP.choice
     parsePort :: AP.Parser Msg
     parsePort = parseFixedLength 3 >> AP.word8 9 >> AP.take 2 >>= ( return . PortMsg . read . BS8.unpack )
 
-encodeInt32BE, lenPrefixMsg, idPrefixMsg :: Int -> BB.Builder
-encodeInt32BE  = BB.int32BE . fromIntegral
-lenPrefixMsg   = encodeInt32BE
+_encdoeInt32BE, lenPrefixMsg, idPrefixMsg :: Int -> BB.Builder
+_encdoeInt32BE  = BB.int32BE . fromIntegral
+lenPrefixMsg   = _encdoeInt32BE
 idPrefixMsg    = BB.int8    . fromIntegral
 
 _encodeMsg :: Msg -> B.ByteString
@@ -204,7 +197,7 @@ _encodeMsg UninterestedMsg = toStrictBS
 _encodeMsg ( HaveMsg _pIndex ) = toStrictBS
   $ lenPrefixMsg 5
   <> idPrefixMsg 4
-  <> encodeInt32BE _pIndex
+  <> _encdoeInt32BE _pIndex
 _encodeMsg ( BitfieldMsg _bf ) = toStrictBS
   $ lenPrefixMsg ( 1 + B.length _bf )
   <> idPrefixMsg 5
@@ -212,16 +205,16 @@ _encodeMsg ( BitfieldMsg _bf ) = toStrictBS
 _encodeMsg ( RequestMsg _pIndex _bIndex _bLen ) = toStrictBS
   $ lenPrefixMsg 13
   <> idPrefixMsg 6
-  <> encodeInt32BE _pIndex
-  <> encodeInt32BE _bIndex
-  <> encodeInt32BE _bLen
+  <> _encdoeInt32BE _pIndex
+  <> _encdoeInt32BE _bIndex
+  <> _encdoeInt32BE _bLen
 _encodeMsg ( PieceMsg _block ) = encode _block
 _encodeMsg ( CancelMsg _pIndex _bIndex _bLen ) = toStrictBS
   $ lenPrefixMsg 13
   <> idPrefixMsg 8
-  <> encodeInt32BE _pIndex
-  <> encodeInt32BE _bIndex
-  <> encodeInt32BE _bLen
+  <> _encdoeInt32BE _pIndex
+  <> _encdoeInt32BE _bIndex
+  <> _encdoeInt32BE _bLen
 _encodeMsg ( PortMsg _port ) = toStrictBS
   $ lenPrefixMsg 3
   <> idPrefixMsg 9
@@ -231,5 +224,5 @@ instance Serialize Msg where
   encode = _encodeMsg
   decode = _decodeMsg
 
-receiveMsg :: (TCP.Socket, TCP.SockAddr) -> MaybeT IO Msg
+receiveMsg :: ReaderT (TCP.Socket, TCP.SockAddr) ( MaybeT IO ) Msg
 receiveMsg = let prefixLen = 4 in receiveTCP prefixLen

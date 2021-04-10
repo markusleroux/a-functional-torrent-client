@@ -43,6 +43,7 @@ library:
   - hashable
   - stm
   - transformers
+  - mtl
 
 executables:
   a-functional-torrent-client-exe:

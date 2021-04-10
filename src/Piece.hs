@@ -19,8 +19,10 @@ import Lens.Micro.TH
 import Control.Monad
 import Control.Concurrent.Chan
 import Control.Concurrent.MVar
+import Control.Monad.IO.Class
 
 import Base
+import Connection
 
 -------------
 
@@ -69,27 +71,27 @@ $(makeLenses ''Blocks)
 instance Show Blocks where
   show p = concat [ "Piece ", show $ p ^. hIndex, ": ", show $ p ^. hSize, " blocks."]
 
-collectBlocks :: Blocks -> IO B.ByteString
-collectBlocks h = B.pack <$> ( h ^. hBlocks . to getElems  )
+collectBlocks :: MonadIO m => Blocks -> m B.ByteString
+collectBlocks h = liftIO $ B.pack <$> ( h ^. hBlocks . to getElems  )
    
 -------------
 
 data Handle = Complete B.ByteString | Incomplete Blocks
 
-new :: Index -> PLength -> IO Handle
-new _hIndex _hSize =
+new :: MonadIO m => Index -> PLength -> m Handle
+new _hIndex _hSize = liftIO $
   do _hBlocks   <- newListArray (0, _hSize) [ 0 | _ <- [0.._hSize]]
      _hBitfield <- newMVarBF _hSize
      return $ Incomplete Blocks{..}
 
-complete :: Handle -> IO Handle
-complete ( Incomplete h ) = Complete <$> collectBlocks h
+complete :: MonadIO m => Handle -> m Handle
+complete ( Incomplete h ) = liftIO $ Complete <$> collectBlocks h
 complete h = return h
 
-writeBlock :: Handle -> Chan Handle -> Block -> IO ()
-writeBlock h@( Incomplete piece ) chan block = do
+writeBlock :: MonadIO m => Handle -> Chan Handle -> Block -> m ()
+writeBlock h@( Incomplete piece ) chan block = liftIO $ do
   addBlock ( block ^. bData ) ( block ^. bIndex ) ( block ^. bLength )
-  isFinishedPiece <- and <$> ( sequence . map readMVar . elems $ piece ^. hBitfield )
+  isFinishedPiece <- and <$> ( sequence . map readMVar $ piece ^. hBitfield . to elems)
   when isFinishedPiece $ writeChan chan h
   where
     addBlock :: B.ByteString -> BIndex -> BLength -> IO ()
