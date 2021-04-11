@@ -1,6 +1,6 @@
 -- | 
 {-# OPTIONS_GHC -fno-warn-unused-binds -fno-warn-name-shadowing -fno-warn-unused-matches #-}
-{-# LANGUAGE OverloadedStrings, DataKinds, TemplateHaskell, RecordWildCards #-}
+{-# LANGUAGE OverloadedStrings, DataKinds, TemplateHaskell, RecordWildCards, FlexibleContexts #-}
 
 module Peer where
 
@@ -11,10 +11,7 @@ import qualified Data.ByteString.Builder as BB
 import Data.ByteString.Lazy (toStrict)
 import Data.Maybe
 
-import Control.Monad (void)
-import Control.Monad.Trans.Maybe
-import Control.Monad.Trans.Reader
-import Control.Monad.IO.Class
+import Control.Monad.Reader
 
 import Lens.Micro.TH
 import Lens.Micro.Platform (to, (&), (<&>), (^.), (.~), (?~))
@@ -27,6 +24,7 @@ import qualified Piece
 import qualified Bencode
 
 ------- Handle --------
+-- Type 2: ReaderT (TCP.Sock, TCP.Addr)
 
 data Handle = Handle
   { _cIP        :: IP
@@ -38,13 +36,11 @@ data Handle = Handle
 $(makeLenses ''Handle)
 
 instance Show Handle where
-  show h =
-    let
+  show h = concat [ "Peer ", id, "( ", ip, port, " )"]
+    where
       id     = h ^. cID . to show
       ip     = h ^. cIP
       port   = h ^. cPort . to show
-    in
-      concat [ "Peer ", id, "( ", ip, port, " )"]
 
 instance Eq Handle where
   (==) peer other = peer ^. cID == peer ^. cID
@@ -98,7 +94,7 @@ _encodeHS h
       , h ^. hsInfoHash . to getSHA1 . to BB.byteString
       ]
 
-_receiveHSPart1 :: ReaderT ( TCP.Socket, TCP.SockAddr ) ( MaybeT IO ) Handshake
+_receiveHSPart1 :: (MonadIO m, MonadReader (TCP.Socket, TCP.SockAddr) m) => m Handshake
 _receiveHSPart1 = let prefixLen = 1 in receiveTCP prefixLen
 
 ------ General -------
@@ -133,7 +129,11 @@ _decodeMsg = AP.choice
   ]
   where
     parseFixedLength :: Int -> AP.Parser Int
-    parseFixedLength n = parseLengthPrefix >>= ( \ l -> if n == l then fail "Length does not match expected length." else return l )
+    parseFixedLength n = do
+      lenPre <- parseLengthPrefix
+      if n /= lenPre
+        then fail "Length does not match expected length."
+        else return lenPre
 
     parseKeepAlive :: AP.Parser Msg
     parseKeepAlive = parseFixedLength 0 >> return KeepAliveMsg
@@ -224,5 +224,5 @@ instance Serialize Msg where
   encode = _encodeMsg
   decode = _decodeMsg
 
-receiveMsg :: ReaderT (TCP.Socket, TCP.SockAddr) ( MaybeT IO ) Msg
+receiveMsg :: (MonadIO m, MonadReader (TCP.Socket, TCP.SockAddr) m) => m Msg
 receiveMsg = let prefixLen = 4 in receiveTCP prefixLen

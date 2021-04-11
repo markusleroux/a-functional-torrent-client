@@ -29,6 +29,7 @@ import qualified Peer
 import qualified Bencode
 
 ---------------
+-- layer 1: MonadIO
 
 data MetaInfo = Meta
   { _mAnnounce     :: String            -- the URL of the tracker
@@ -111,7 +112,7 @@ _decodeTR meta = do
 
 instance Serialize TrackerResponse where
   encode = undefined
-  decode = _decodeTR
+  decode = undefined --_decodeTR
 
 data Handle = Handle
   { _hMeta               :: MetaInfo

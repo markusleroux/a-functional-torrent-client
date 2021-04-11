@@ -44,6 +44,7 @@ library:
   - stm
   - transformers
   - mtl
+  - unliftio
 
 executables:
   a-functional-torrent-client-exe:

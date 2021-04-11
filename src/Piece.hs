@@ -25,6 +25,7 @@ import Base
 import Connection
 
 -------------
+-- layer 1: MonadIO
 
 data Block = Block
   { _bIndex   :: BIndex
