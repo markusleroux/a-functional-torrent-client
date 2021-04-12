@@ -48,8 +48,7 @@ parseBlock = do
     _bData   <- AP.take ( _bLength - 9 )
     return $ Piece.Block{..}
 
-instance Serialize Block where
-  decode = parseBlock
+instance Encode Block where
   encode block = toStrictBS $ mconcat
     [ block ^. bData . to B.length . to ( + 9 ) . to fromIntegral . to BB.int32BE
     , BB.int32BE 7
@@ -57,7 +56,12 @@ instance Serialize Block where
     , block ^. bIndex . to fromIntegral . to BB.int32BE
     , block ^. bData  . to BB.byteString
     ]
-   
+
+instance Decode Block where
+  decode = parseBlock
+
+instance Serialize Block
+
 -------------
 
 data Blocks = Blocks

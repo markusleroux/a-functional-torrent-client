@@ -81,8 +81,8 @@ trHasPeerID tr id = mapConfig $ tr ^. trPeers
     mapConfig :: [Peer.Handle] -> Bool
     mapConfig = hasID . catMaybes . map ( ^. Peer.cID )
 
-_decodeTR :: MetaInfo -> AP.Parser TrackerResponse
-_decodeTR meta = do
+_decodeTR :: HasInfoHash a => a -> AP.Parser TrackerResponse
+_decodeTR v = do
   d <- Bencode.dictionaryParser
   case
     sequenceT  ( d HM.!? "interval"    >>= Bencode.intMb
@@ -101,7 +101,7 @@ _decodeTR meta = do
     getPeers bv = Bencode.listMb bv >>= ( sequence . map getPeer )
 
     getPeer :: Bencode.BenValue -> Maybe Peer.Handle
-    getPeer bv = let _hInfoHash = Left $ meta ^. mInfoHash in
+    getPeer bv = let _hInfoHash = Left $ getInfoHash v in
       do
         d       <- Bencode.dictionaryMb bv
         let _cID = d HM.!? "peer_id" >>= Bencode.stringMb
@@ -110,8 +110,7 @@ _decodeTR meta = do
         -- problem
         return Peer.Handle{ .. }
 
-instance Serialize TrackerResponse where
-  encode = undefined
+instance Decode TrackerResponse where
   decode = undefined --_decodeTR
 
 data Handle = Handle

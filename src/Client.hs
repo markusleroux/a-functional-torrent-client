@@ -8,6 +8,8 @@ import Prelude hiding (length)
 
 import qualified Data.Text as T
 import qualified Data.HashMap.Strict as HM
+import Data.Maybe (isJust)
+import Data.Array
 import Data.IORef
 
 import Control.Monad.IO.Class
@@ -15,7 +17,7 @@ import Control.Monad.Reader
 import Control.Monad.Trans.Maybe
 import Control.Concurrent.MVar
 
-import Lens.Micro.Platform (to, ix, (^.), (^?), (.~), (&), (<&>))
+import Lens.Micro.Platform (to, ix, (^.), (^?))
 import Lens.Micro.TH
 
 import qualified Network.Simple.TCP as TCP
@@ -38,16 +40,32 @@ data Config = Config
   , _hRoot  :: FilePath
   } deriving (Eq)
 
+$(makeLenses ''Config)
+
 data Handle = Handle
   { _hConfig       :: Config
   , _hDownloads    :: HM.HashMap SHA1 Down.Handle
   } deriving (Eq)
 
-$(makeLenses ''Config)
 $(makeLenses ''Handle)
 
 new :: Config -> Handle
 new _hConfig = Handle { _hDownloads = HM.empty, .. }
+
+class HasDownloads a where
+  getDownloads :: a -> HM.HashMap SHA1 Down.Handle
+
+  getDownload :: HasInfoHash b => a -> b -> Maybe Down.Handle
+  getDownload x v = ( getDownloads x ) HM.!? ( getInfoHash v )
+
+  knownInfoHash :: HasInfoHash b => a -> b -> Bool
+  knownInfoHash x v = isJust $ getDownload x v
+
+instance HasDownloads Handle where
+  getDownloads = _hDownloads
+
+instance HasDownloads Conn.Env where
+  getDownloads = undefined
  
 trackerRequest :: (MonadIO m, Req.MonadHttp m) => Handle -> Down.Handle -> m Down.TrackerResponse
 trackerRequest client d = do
@@ -76,129 +94,53 @@ trackerRequest client d = do
     trBodyReader :: Http.Response Http.BodyReader -> IO ( Maybe Down.TrackerResponse )
     trBodyReader b = Http.responseBody b >>= return . Conn.runDecode
 
-hsToDownloadMb :: Handle -> Peer.Handshake -> Maybe Down.Handle       -- returns Nothing if hash is not in downloads
-hsToDownloadMb client peerHSP1 = client ^? hDownloads . ix ( peerHSP1 ^. Peer.hsInfoHash )
-
-peerToDownloadMb :: Handle -> Peer.Handle -> Maybe Down.Handle
-peerToDownloadMb client peer = client ^? hDownloads . ix ( peer ^. Peer.hInfoHash . to both )
-
--- returns IO Nothing if hs fails or download is not in downloads list
-receive :: (MonadIO m, MonadReader (TCP.Socket, TCP.SockAddr) m, Conn.Serialize a)
-  => Handle -> Length -> Conn.Data b -> m ( Conn.Data a )
-receive client lenPrefix ( Conn.Data{..} ) = do
-  _other <- Conn.receiveTCP lenPrefix
-  return Conn.Data{ .. }
-
--- returns IO Nothing if hs fails or download is not in downloads list
-receiveHS :: (MonadIO m, MonadReader (TCP.Socket, TCP.SockAddr) m)
-  => Handle -> Conn.Data a -> m ( Conn.Data Peer.Handshake )
-receiveHS client ( Conn.Data{..} ) = do
-  hs <- Peer._receiveHSPart1
-  return $ Conn.Data{ _other = hs, .. }
-
--- create my hs if hash is in downloads
-lookupHS :: Handle -> SHA1 -> Maybe Peer.Handshake
-lookupHS client hash = do
-    _down <- client ^? hDownloads . ix hash
-    return  Peer.Handshake { _hsID       = Nothing
-                           , _hsPstr     = "BitTorrent Protocol"
-                           , _hsInfoHash = _down ^. Down.hMeta . Down.mInfoHash
-                           }
-
--- create my hs from another hs
-getHS :: Handle -> Peer.Handshake -> Maybe Peer.Handshake
-getHS client hs = join $ lookupHS client <$> hs ^? Peer.hsInfoHash
-
-send :: (MonadIO m, MonadReader (TCP.Socket, TCP.SockAddr) m, Conn.Serialize a)
-     => Handle -> a -> m a 
-send client x = do
-  (sock, _) <- ask
-  TCP.send sock $ Conn.encode x
-  return x
-
-sendAs :: (MonadIO m, MonadReader (TCP.Socket, TCP.SockAddr) m, Conn.Serialize b)
-       => Handle -> ( a -> b ) -> a -> m a
-sendAs client mutate x = send client ( mutate x ) >> return x
-
-sendHS :: (MonadIO m, MonadReader (TCP.Socket, TCP.SockAddr) m)
-       => Handle -> Conn.Data Peer.Handshake -> m ( Conn.Data Peer.Handshake )
-sendHS = flip sendAs ( ^. Conn.other )
-
-initPeerBF :: (MonadIO m, MonadReader (TCP.Socket, TCP.SockAddr) m)
-             => Handle -> Conn.Data Peer.Handshake -> m ( Conn.Data Bitfield )
-initPeerBF client iData@( Conn.Data{ .. } ) =
-  case hsToDownloadMb client _other of
-    Just _down -> return Conn.Data{ _other = newBF $ _down ^. Down.hMeta . Down.mInfo . Down.tDLen, .. }
-    Nothing -> throwString "Failed to initialize bitfield."
-
--- initPeerBF' :: Handle -> Conn.Data Peer.Handshake -> Conn.TCP ( Conn.Data Bitfield )
--- initPeerBF' client iData@( Conn.Data{ .. } ) =
---   ReaderT $ \ ( sock, addr ) -> MaybeT . return $ do
---     _down <- hsToDownloadMb client _other
---     return Conn.Data{ _other = newBF $ _down ^. Down.hMeta . Down.mInfo . Down.tDLen, .. }
-
--- initPeerBF :: Handle -> Conn.Data Peer.Handshake -> Conn.TCP ( Conn.Data Bitfield )
--- initPeerBF client iData@( Conn.Data{ .. } ) =
---   ReaderT $ \ ( sock, addr ) -> MaybeT . return $ do
---     _down <- hsToDownloadMb client _other
---     return Conn.Data{ _other = newBF $ _down ^. Down.hMeta . Down.mInfo . Down.tDLen, .. }
-
-regularConnection :: Conn.Data Bitfield -> Conn.TCP ()
-regularConnection Conn.Data { .. } = undefined
+regularConnection :: m ()
+regularConnection = undefined
 
 ----- Incoming ------
 
-compareInfoHash :: (MonadIO m) => Handle -> Conn.Data Peer.Handshake -> m ( Conn.Data Peer.Handshake )
-compareInfoHash client Conn.Data{..} =
-  case getHS client _other of
-    Just hs -> return Conn.Data{ _other = hs, .. }
-    Nothing -> throwString "Peer info hash not found locally."
-
-initServer :: (MonadIO m, MonadReader (TCP.Socket, TCP.SockAddr) m) => Handle -> m ( Conn.Data Bitfield )
-initServer client = Conn.initData >>= receiveHS' >>= compareInfoHash' >>= sendHS' >>= initPeerBF'
-  where
-    receiveHS'       = receiveHS         client
-    compareInfoHash' = compareInfoHash   client
-    sendHS'          = sendHS            client
-    initPeerBF'      = initPeerBF      client
+initServer :: (MonadIO m, MonadReader env m, Conn.HasTCP env, HasDownloads env) => m ()
+initServer = do
+  env <- ask
+  hs  <- Conn.receiveTCP env :: m Peer.Handshake
+  if knownInfoHash env hs
+    then Conn.sendTCP env $ Peer.createHandshake hs
+    else throwString "Peer Info Hash not in downloads."
 
 serve :: Handle -> IO ()
 serve client =
   let
     clientPort  = client ^. hConfig . cPort . to show
-    initServer' = initServer client
-  in
-    TCP.serve TCP.HostAny clientPort
-      $ void . runMaybeT . runReaderT ( initServer' >>= regularConnection )
+  in do
+    (peerState, clientState) <- Conn.initState
+    bf <- newIORef $ array (0, 0) []  -- empty
+    TCP.serve TCP.HostAny clientPort $ Conn.uncurryEnv peerState clientState bf
+      $ runReaderT ( initServer >> regularConnection )
 
 ----- Outgoing ------
 
-signHS :: (MonadIO m) => Handle -> Peer.Handle -> Conn.Data () -> m (Conn.Data Peer.Handshake)
-signHS client peer Conn.Data{..} = do
-  case lookupHS client $ both $ peer ^. Peer.hInfoHash of
-    Just myHS -> return Conn.Data{ _other = myHS, .. }
-    Nothing -> throwString "Peer info hash not found locally."
-
-initConnect :: (MonadIO m, MonadReader (TCP.Socket, TCP.SockAddr) m) => Handle -> Peer.Handle -> m ( Conn.Data Bitfield )
-initConnect client peer = Conn.initData >>= signHS' >>= sendHS' >>= receiveHS' >>= initPeerBF'
-  where
-    signHS'      = signHS       client peer
-    sendHS'      = sendHS       client
-    receiveHS'   = receiveHS    client
-    initPeerBF'  = initPeerBF client
+initConnect :: (MonadIO m, MonadReader env m, Conn.HasTCP env, HasDownloads env) => Peer.Handle -> m ()
+initConnect peer = do
+  env <- ask
+  Conn.sendTCP env $ Peer.createHandshake peer
+  hs <- Conn.receiveTCP env :: m Peer.Handshake
+  if getInfoHash hs == getInfoHash peer
+    then return ()
+    else throwString "Peer did not respond with expected info hash"
+  
 
 -- improve receiveHSWrapped to avoid throwing away and recreating
 -- and to get _down from monad
-connect :: MonadIO m => Handle -> Peer.Handle -> m ()
+connect :: (MonadIO m) => Handle -> Peer.Handle -> m ()
 connect client peer =
   let
     pIP = peer ^. Peer.cIP
     pPort = peer ^. Peer.cPort . to show
-  in
-    liftIO $ TCP.connect pIP pPort
-      $ void . runMaybeT . runReaderT ( initConnect' >>= regularConnection )
-  where
-    initConnect' = initConnect client peer
+  in do
+    (peerState, clientState) <- Conn.initState
+    bf <- liftIO $ newIORef $ array (0, 0) []  -- empty
+    liftIO $ TCP.connect pIP pPort $ Conn.uncurryEnv peerState clientState bf
+      $ runReaderT ( initConnect peer >> regularConnection )
 
 contactPeers :: MonadIO m => Handle -> SHA1 -> m ()
 contactPeers client infoHash = maybe ( return () ) contactPeers' $ downMb

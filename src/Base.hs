@@ -18,6 +18,7 @@ import qualified Data.Attoparsec.ByteString as AP
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BS8
 import Data.ByteString.Lazy (toStrict)
+import Data.IORef
 
 import Lens.Micro.Platform (_Right, to, (^?))
 
@@ -49,6 +50,9 @@ bfFromBS :: B.ByteString -> Bitfield
 bfFromBS bs = let bl = concatMap toListBE $ B.unpack bs in
   Arr.listArray (0, length bl - 1) bl
 
+class HasBitfield a where
+  getBF :: a -> IORef Bitfield
+
 -----------------
 
 newtype SHA1 = SHA1 { getSHA1 :: B.ByteString } deriving (Eq)
@@ -61,6 +65,12 @@ instance Hashable SHA1 where
 
 newSHA1 :: B.ByteString -> SHA1
 newSHA1 = SHA1 . SHA1.hash
+
+class HasInfoHash a where
+  getInfoHash :: a -> SHA1
+
+instance HasInfoHash SHA1 where
+  getInfoHash = id
 
 -----------------
 

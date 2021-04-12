@@ -16,21 +16,18 @@ import Control.Monad.Reader
 import Lens.Micro.TH
 import Lens.Micro.Platform (to, (&), (<&>), (^.), (.~), (?~))
 
-import qualified Network.Simple.TCP as TCP
-
 import Base
 import Connection
 import qualified Piece
 import qualified Bencode
 
 ------- Handle --------
--- Type 2: ReaderT (TCP.Sock, TCP.Addr)
 
 data Handle = Handle
   { _cIP        :: IP
   , _cPort      :: Port
   , _cID        :: Maybe ID
-  , _hInfoHash  :: Either SHA1 SHA1
+  , _hInfoHash  :: SHA1
   }
 
 $(makeLenses ''Handle)
@@ -45,8 +42,8 @@ instance Show Handle where
 instance Eq Handle where
   (==) peer other = peer ^. cID == peer ^. cID
 
-new :: IP -> Port -> Maybe ID -> SHA1 -> Handle
-new _cIP _cPort _cID _hInfoHashTR = Handle { _hInfoHash = Left _hInfoHashTR, .. }
+instance HasInfoHash Handle where
+  getInfoHash = _hInfoHash
   
 ------ Handshake -------
 
@@ -57,10 +54,24 @@ data Handshake = Handshake
   } deriving (Show, Eq)
 
 $(makeLenses ''Handshake)
-      
-instance Serialize Handshake where
-  encode = _encodeHS 
-  decode = _decodeHSPart1
+
+instance HasInfoHash Handshake where
+  getInfoHash = _hsInfoHash
+
+_encodeHS :: Handshake -> B.ByteString
+_encodeHS h
+    | h ^. hsID . to isJust
+    = ( h ^. hsID . to fromJust . to BB.string8 . to BB.toLazyByteString . to toStrict ) <> encode ( h & hsID .~ Nothing )
+    | otherwise
+    = toStrictBS $ mconcat
+      [ h ^. hsPstr . to length . to fromIntegral . to BB.int32BE
+      , h ^. hsPstr . to BB.string8
+      , BB.int64BE 0
+      , h ^. hsInfoHash . to getSHA1 . to BB.byteString
+      ]
+
+instance Encode Handshake where
+  encode = _encodeHS
 
 _decodeHSPart1 :: AP.Parser Handshake
 _decodeHSPart1 = do
@@ -82,20 +93,17 @@ _decodeHSPart2 ph = Bencode.stringParser 20 >>= return . handshakeFromPartial ph
 _decodeHS :: AP.Parser Handshake
 _decodeHS = _decodeHSPart1 >>= _decodeHSPart2
 
-_encodeHS :: Handshake -> B.ByteString
-_encodeHS h
-    | h ^. hsID . to isJust
-    = ( h ^. hsID . to fromJust . to BB.string8 . to BB.toLazyByteString . to toStrict ) <> encode ( h & hsID .~ Nothing )
-    | otherwise
-    = toStrictBS $ mconcat
-      [ h ^. hsPstr . to length . to fromIntegral . to BB.int32BE
-      , h ^. hsPstr . to BB.string8
-      , BB.int64BE 0
-      , h ^. hsInfoHash . to getSHA1 . to BB.byteString
-      ]
+instance Decode Handshake where
+  decode = _decodeHSPart1
+      
+instance Serialize Handshake
 
-_receiveHSPart1 :: (MonadIO m, MonadReader (TCP.Socket, TCP.SockAddr) m) => m Handshake
-_receiveHSPart1 = let prefixLen = 1 in receiveTCP prefixLen
+createHandshake :: HasInfoHash a => a -> Peer.Handshake
+createHandshake v =
+  Peer.Handshake { _hsID       = Nothing
+                 , _hsPstr     = "BitTorrent Protocol"
+                 , _hsInfoHash = getInfoHash v
+                 }
 
 ------ General -------
 
@@ -174,6 +182,9 @@ _decodeMsg = AP.choice
     parsePort :: AP.Parser Msg
     parsePort = parseFixedLength 3 >> AP.word8 9 >> AP.take 2 >>= ( return . PortMsg . read . BS8.unpack )
 
+instance Decode Msg where
+  decode = _decodeMsg
+
 _encdoeInt32BE, lenPrefixMsg, idPrefixMsg :: Int -> BB.Builder
 _encdoeInt32BE  = BB.int32BE . fromIntegral
 lenPrefixMsg   = _encdoeInt32BE
@@ -219,10 +230,8 @@ _encodeMsg ( PortMsg _port ) = toStrictBS
   $ lenPrefixMsg 3
   <> idPrefixMsg 9
   <> ( BB.int16BE . fromIntegral $ _port )
- 
-instance Serialize Msg where
-  encode = _encodeMsg
-  decode = _decodeMsg
 
-receiveMsg :: (MonadIO m, MonadReader (TCP.Socket, TCP.SockAddr) m) => m Msg
-receiveMsg = let prefixLen = 4 in receiveTCP prefixLen
+instance Encode Msg where
+  encode = _encodeMsg
+  
+instance Serialize Msg
