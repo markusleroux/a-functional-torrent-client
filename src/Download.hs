@@ -29,7 +29,6 @@ import qualified Peer
 import qualified Bencode
 
 ---------------
--- layer 1: MonadIO
 
 data MetaInfo = Meta
   { _mAnnounce     :: String            -- the URL of the tracker
@@ -101,7 +100,7 @@ _decodeTR v = do
     getPeers bv = Bencode.listMb bv >>= ( sequence . map getPeer )
 
     getPeer :: Bencode.BenValue -> Maybe Peer.Handle
-    getPeer bv = let _hInfoHash = Left $ getInfoHash v in
+    getPeer bv = let _hInfoHash = getInfoHash v in
       do
         d       <- Bencode.dictionaryMb bv
         let _cID = d HM.!? "peer_id" >>= Bencode.stringMb

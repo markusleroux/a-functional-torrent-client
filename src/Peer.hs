@@ -185,9 +185,9 @@ _decodeMsg = AP.choice
 instance Decode Msg where
   decode = _decodeMsg
 
-_encdoeInt32BE, lenPrefixMsg, idPrefixMsg :: Int -> BB.Builder
-_encdoeInt32BE  = BB.int32BE . fromIntegral
-lenPrefixMsg   = _encdoeInt32BE
+_encodeInt32BE, lenPrefixMsg, idPrefixMsg :: Int -> BB.Builder
+_encodeInt32BE  = BB.int32BE . fromIntegral
+lenPrefixMsg   = _encodeInt32BE
 idPrefixMsg    = BB.int8    . fromIntegral
 
 _encodeMsg :: Msg -> B.ByteString
@@ -208,7 +208,7 @@ _encodeMsg UninterestedMsg = toStrictBS
 _encodeMsg ( HaveMsg _pIndex ) = toStrictBS
   $ lenPrefixMsg 5
   <> idPrefixMsg 4
-  <> _encdoeInt32BE _pIndex
+  <> _encodeInt32BE _pIndex
 _encodeMsg ( BitfieldMsg _bf ) = toStrictBS
   $ lenPrefixMsg ( 1 + B.length _bf )
   <> idPrefixMsg 5
@@ -216,16 +216,16 @@ _encodeMsg ( BitfieldMsg _bf ) = toStrictBS
 _encodeMsg ( RequestMsg _pIndex _bIndex _bLen ) = toStrictBS
   $ lenPrefixMsg 13
   <> idPrefixMsg 6
-  <> _encdoeInt32BE _pIndex
-  <> _encdoeInt32BE _bIndex
-  <> _encdoeInt32BE _bLen
+  <> _encodeInt32BE _pIndex
+  <> _encodeInt32BE _bIndex
+  <> _encodeInt32BE _bLen
 _encodeMsg ( PieceMsg _block ) = encode _block
 _encodeMsg ( CancelMsg _pIndex _bIndex _bLen ) = toStrictBS
   $ lenPrefixMsg 13
   <> idPrefixMsg 8
-  <> _encdoeInt32BE _pIndex
-  <> _encdoeInt32BE _bIndex
-  <> _encdoeInt32BE _bLen
+  <> _encodeInt32BE _pIndex
+  <> _encodeInt32BE _bIndex
+  <> _encodeInt32BE _bLen
 _encodeMsg ( PortMsg _port ) = toStrictBS
   $ lenPrefixMsg 3
   <> idPrefixMsg 9

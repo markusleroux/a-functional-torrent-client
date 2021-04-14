@@ -1,6 +1,6 @@
 -- |
 {-# OPTIONS_GHC -fno-warn-unused-binds -fno-warn-name-shadowing -fno-warn-unused-matches #-}
-{-# LANGUAGE OverloadedStrings, DataKinds, TemplateHaskell, RecordWildCards, FlexibleInstances, FlexibleContexts #-}
+{-# LANGUAGE OverloadedStrings, DataKinds, TemplateHaskell, RecordWildCards, FlexibleInstances, FlexibleContexts, GADTs, MultiParamTypeClasses #-}
 
 module Client where
 
@@ -11,13 +11,13 @@ import qualified Data.HashMap.Strict as HM
 import Data.Maybe (isJust)
 import Data.Array
 import Data.IORef
+import qualified Data.ByteString as B
 
 import Control.Monad.IO.Class
 import Control.Monad.Reader
-import Control.Monad.Trans.Maybe
 import Control.Concurrent.MVar
 
-import Lens.Micro.Platform (to, ix, (^.), (^?))
+import Lens.Micro.Platform (to, ix, (^.), (.~))
 import Lens.Micro.TH
 
 import qualified Network.Simple.TCP as TCP
@@ -25,6 +25,7 @@ import qualified Network.HTTP.Req as Req
 import qualified Network.HTTP.Client as Http
 
 import UnliftIO.Exception
+import UnliftIO.Timeout
 
 import qualified Download as Down
 import qualified Peer
@@ -44,28 +45,95 @@ $(makeLenses ''Config)
 
 data Handle = Handle
   { _hConfig       :: Config
-  , _hDownloads    :: HM.HashMap SHA1 Down.Handle
+  , _hDownloads    :: IORef ( HM.HashMap SHA1 Down.Handle )
   } deriving (Eq)
 
 $(makeLenses ''Handle)
 
-new :: Config -> Handle
-new _hConfig = Handle { _hDownloads = HM.empty, .. }
+new :: MonadIO m => Config -> m Handle
+new _hConfig =  liftIO $ Handle _hConfig <$> newIORef HM.empty
 
 class HasDownloads a where
-  getDownloads :: a -> HM.HashMap SHA1 Down.Handle
+  getDownloadsRef :: a -> IORef ( HM.HashMap SHA1 Down.Handle )
 
-  getDownload :: HasInfoHash b => a -> b -> Maybe Down.Handle
-  getDownload x v = ( getDownloads x ) HM.!? ( getInfoHash v )
+  getDownload :: (MonadIO m, HasInfoHash b) => a -> b -> m ( Maybe Down.Handle )
+  getDownload x v = do
+    downs <- liftIO . readIORef $ getDownloadsRef x
+    return $ downs HM.!? ( getInfoHash v )
 
-  knownInfoHash :: HasInfoHash b => a -> b -> Bool
-  knownInfoHash x v = isJust $ getDownload x v
+  knownInfoHash :: (MonadIO m, HasInfoHash b) => a -> b -> m Bool
+  knownInfoHash x v = isJust <$> getDownload x v
 
 instance HasDownloads Handle where
-  getDownloads = _hDownloads
+  getDownloadsRef = _hDownloads
 
-instance HasDownloads Conn.Env where
-  getDownloads = undefined
+instance HasDownloads Conn.TCP where
+  getDownloadsRef = undefined
+
+class ( HasDownloads env, HasBitfield env, Conn.HasConnectionState env ) => ConnectionEnv env where
+  send    :: (MonadIO m, Conn.Encode b) => b -> env -> m ()
+  receive :: (MonadIO m, Conn.Decode b) => env -> m b
+  close   :: (MonadIO m) => env -> m Bool
+  
+instance ConnectionEnv Conn.TCP where
+  send    = Conn.sendTCP
+  receive = Conn.receiveTCP
+  close   = undefined
+
+_initServe :: (MonadIO m, ConnectionEnv env, MonadReader env m) => m ()
+_initServe = join . reader $ ( \ e -> do
+  hs  <- receive e :: MonadIO m => m Peer.Handshake
+  isKnown <- knownInfoHash e hs
+  if isKnown
+    then ( send ( Peer.createHandshake hs ) e ) >> ( runReaderT $ initBF hs ) e
+    else throwString "Peer Info Hash not in downloads."
+  )
+
+_initConnect :: (MonadIO m, ConnectionEnv env, MonadReader env m) => Peer.Handle -> m ()
+_initConnect peer = join . reader $ ( \ e -> do
+  send ( Peer.createHandshake peer ) e
+  hs <- receive e :: MonadIO m => m Peer.Handshake
+  if getInfoHash hs == getInfoHash peer
+    then runReaderT ( initBF hs ) e
+    else throwString "Peer did not respond with expected info hash."
+  )
+
+_connection :: (MonadIO m, ConnectionEnv env, MonadReader env m) => m ()
+_connection = join . reader $ ( \ e -> forever $ interact e )
+  where
+    interact :: ( MonadIO m, ConnectionEnv env ) => env -> m ()
+    interact e = do
+      msgMb <- liftIO $ timeout (10^6 * 120) ( receive e :: IO Peer.Msg )
+      case msgMb of
+        Nothing -> undefined
+        Just msg -> case msg of
+          Peer.KeepAliveMsg    -> handleKeepAlive
+          Peer.ChokeMsg        -> handleChokeMsg
+          Peer.UnchokeMsg      -> handleUnchokeMsg
+          Peer.InterestedMsg   -> handleInterestedMsg
+          Peer.UninterestedMsg -> handleUninterestedMsg
+          Peer.HaveMsg pIndex  -> handleHaveMsg pIndex
+          Peer.BitfieldMsg bs  -> handleBFMsg bs
+
+          Peer.RequestMsg pIndex bIndex bLength -> undefined
+          Peer.CancelMsg  pIndex bIndex bLength  -> undefined
+          Peer.PieceMsg block  -> undefined
+          Peer.PortMsg port    -> undefined
+    
+class (MonadIO m, ConnectionEnv env, MonadReader env m) => ConnectionAlgo env m where
+  connection :: m ()
+  connection = _connection
+  
+  initServe :: m ()
+  initServe = _initServe
+
+  initConnect :: Peer.Handle -> m ()
+  initConnect = _initConnect
+  
+  serve :: Handle -> m ()
+  connect :: Handle -> Peer.Handle -> m ()
+
+-------------------
  
 trackerRequest :: (MonadIO m, Req.MonadHttp m) => Handle -> Down.Handle -> m Down.TrackerResponse
 trackerRequest client d = do
@@ -94,45 +162,58 @@ trackerRequest client d = do
     trBodyReader :: Http.Response Http.BodyReader -> IO ( Maybe Down.TrackerResponse )
     trBodyReader b = Http.responseBody b >>= return . Conn.runDecode
 
-regularConnection :: m ()
-regularConnection = undefined
+initBF :: ( MonadIO m, MonadReader env m
+          , Base.HasBitfield env, HasDownloads env
+          , HasInfoHash a) => a -> m ()
+initBF v = do
+  env    <- ask
+  downMb <- getDownload env v
+  case downMb of
+    Just down -> liftIO $ writeIORef ( getBF env ) $ down ^. Down.hMeta . Down.mInfo . Down.tDLen . to newBF
+    Nothing   -> throwString "Failed to initialize bitfield."
+
+----- Regular -------
+
+handleKeepAlive :: m ()
+handleKeepAlive = undefined
+
+handleChokeMsg :: (MonadIO m, ConnectionEnv env, MonadReader env m) => m ()
+handleChokeMsg = asks Conn.getPeerState >>= Conn.flipChoked
+
+handleUnchokeMsg :: (MonadIO m, ConnectionEnv env, MonadReader env m) => m ()
+handleUnchokeMsg = asks Conn.getPeerState >>= Conn.flipChoked
+
+handleInterestedMsg :: (MonadIO m, ConnectionEnv env, MonadReader env m) => m ()
+handleInterestedMsg = asks Conn.getPeerState >>= Conn.flipInterested
+
+handleUninterestedMsg :: (MonadIO m, ConnectionEnv env, MonadReader env m) => m ()
+handleUninterestedMsg = asks Conn.getPeerState >>= Conn.flipInterested
+
+handleHaveMsg :: (MonadIO m, ConnectionEnv env, MonadReader env m) => PIndex -> m ()
+handleHaveMsg pIndex = do
+  bf <- getBF <$> ask
+  liftIO $ modifyIORef bf ( ix pIndex .~ True )
+
+handleBFMsg :: (MonadIO m, MonadReader env m, Base.HasBitfield env) => B.ByteString -> m ()
+handleBFMsg bfBS = do
+  bfIORef <- getBF <$> ask
+  liftIO . writeIORef bfIORef . bfFromBS $ bfBS
 
 ----- Incoming ------
 
-initServer :: (MonadIO m, MonadReader env m, Conn.HasTCP env, HasDownloads env) => m ()
-initServer = do
-  env <- ask
-  hs  <- Conn.receiveTCP env :: m Peer.Handshake
-  if knownInfoHash env hs
-    then Conn.sendTCP env $ Peer.createHandshake hs
-    else throwString "Peer Info Hash not in downloads."
-
-serve :: Handle -> IO ()
-serve client =
-  let
-    clientPort  = client ^. hConfig . cPort . to show
-  in do
+{-
+_serve :: (ConnectionAlgo env m) => Handle -> m ()
+_serve client = let clientPort  = client ^. hConfig . cPort . to show in
+  do
     (peerState, clientState) <- Conn.initState
-    bf <- newIORef $ array (0, 0) []  -- empty
+    bf <- liftIO . newIORef $ array (0, 0) []  -- empty
     TCP.serve TCP.HostAny clientPort $ Conn.uncurryEnv peerState clientState bf
-      $ runReaderT ( initServer >> regularConnection )
+      $ runReaderT ( initServe >> regularConnection )
 
 ----- Outgoing ------
 
-initConnect :: (MonadIO m, MonadReader env m, Conn.HasTCP env, HasDownloads env) => Peer.Handle -> m ()
-initConnect peer = do
-  env <- ask
-  Conn.sendTCP env $ Peer.createHandshake peer
-  hs <- Conn.receiveTCP env :: m Peer.Handshake
-  if getInfoHash hs == getInfoHash peer
-    then return ()
-    else throwString "Peer did not respond with expected info hash"
-  
-
--- improve receiveHSWrapped to avoid throwing away and recreating
--- and to get _down from monad
-connect :: (MonadIO m) => Handle -> Peer.Handle -> m ()
-connect client peer =
+_connect :: (MonadIO m) => Handle -> Peer.Handle -> m ()
+_connect client peer =
   let
     pIP = peer ^. Peer.cIP
     pPort = peer ^. Peer.cPort . to show
@@ -143,13 +224,14 @@ connect client peer =
       $ runReaderT ( initConnect peer >> regularConnection )
 
 contactPeers :: MonadIO m => Handle -> SHA1 -> m ()
-contactPeers client infoHash = maybe ( return () ) contactPeers' $ downMb
+contactPeers client infoHash = do
+  down <- getDownload client infoHash
+  maybe ( return () ) contactPeers' $ down
   where
-    downMb = client ^? hDownloads . ix infoHash
-    
     contactPeers' :: MonadIO m => Down.Handle -> m ()
-    contactPeers' down = sequence_ $ connect client <$> peers
+    contactPeers' down = sequence_ $ _connect client <$> peers
       where
         downLen = down ^. Down.hMeta . Down.mInfo . Down.tDLen
         peers   = down ^. Down.hTrackerResponse . Down.trPeers
         
+-}

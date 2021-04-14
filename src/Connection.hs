@@ -1,12 +1,11 @@
 -- | 
-{-# LANGUAGE TemplateHaskell, FlexibleContexts, RecordWildCards #-}
+{-# LANGUAGE TemplateHaskell, FlexibleContexts, RecordWildCards, GeneralizedNewtypeDeriving, GADTs #-}
 
 module Connection where
 
 import Control.Monad.Trans.Maybe
 import Control.Monad.Reader
 
-import qualified Data.HashMap.Strict as HM
 import Data.IORef
 import qualified Data.ByteString as B
 import qualified Data.Attoparsec.ByteString as AP
@@ -39,58 +38,52 @@ type ClientState = IORef ConnState
 initState :: MonadIO m => m (PeerState, ClientState)
 initState = undefined
 
-data Env = Env
+data TCP = TCP
   { _eTCP         :: (TCP.Socket, TCP.SockAddr)
   , _ePeerState   :: PeerState
   , _eClientState :: ClientState
   , _eBF          :: IORef Bitfield
   }
 
-$(makeLenses ''Env)
+$(makeLenses ''TCP)
 
-uncurryEnv :: (MonadIO m)
-           => PeerState -> ClientState -> IORef Bitfield -> ( Env -> m a ) -> (TCP.Socket, TCP.SockAddr) -> m a
-uncurryEnv _ePeerState _eClientState _eBF f _eTCP = f $ Env{..}
+uncurryEnv :: (MonadIO m) => PeerState -> ClientState -> IORef Bitfield -> ( TCP -> m a ) -> (TCP.Socket, TCP.SockAddr) -> m a
+uncurryEnv _ePeerState _eClientState _eBF f _eTCP = f $ TCP{..}
 
-----------------
-
-instance HasBitfield Env where
+instance HasBitfield TCP where
   getBF = _eBF
 
 ----------------
 
-class HasTCP a where
-  getTCP    :: a -> (TCP.Socket, TCP.SockAddr)
+class TCPEnv a where
+  getTCP :: a -> (TCP.Socket, TCP.SockAddr)
 
-  getSock   :: a -> TCP.Socket
-  getSock = fst . getTCP
+getSock :: TCPEnv env => env -> TCP.Socket
+getSock = fst . getTCP
 
-  sendTCPAs :: (Encode c, MonadIO m) => a -> b -> ( b -> c ) -> m ()
-  sendTCPAs x v mutate = TCP.send ( getSock x ) ( encode . mutate $ v )
-  
-  sendTCP   :: (Encode b, MonadIO m) => a -> b -> m ()
-  sendTCP x v = sendTCPAs x v id
+sendTCPAs :: (Encode c, MonadIO m, TCPEnv env) => b -> ( b -> c ) -> env -> m ()
+sendTCPAs v mutate e = do
+  TCP.send ( getSock e ) ( encode . mutate $ v )
 
-  receiveTCP :: (Decode b, MonadIO m) => a -> m b
-  receiveTCP x = do
-    vMb <- receiveTCPHelper $ getSock x
-    case vMb of
-      Just v -> return v
-      Nothing -> throwString "Failed to receive or parse tracker response."
-    where
-      receiveTCPHelper :: (Decode b, MonadIO m) => TCP.Socket -> m ( Maybe b )
-      receiveTCPHelper sock = runMaybeT $ do
-        lenRaw <- MaybeT $ TCP.recv sock 4
-        len    <- MaybeT . return $ AP.parseOnly parseLengthPrefix lenRaw ^? _Right
-        hsRaw  <- MaybeT $ TCP.recv sock len
-        MaybeT . return $ AP.parseOnly decode ( lenRaw <> hsRaw ) ^? _Right
+sendTCP   :: (Encode b, MonadIO m, TCPEnv env) => b -> env -> m ()
+sendTCP v e = sendTCPAs v id e
 
---instance HasTCP (TCP.Socket, TCP.SockAddr) where
- -- getTCP = id
+receiveTCP :: (Decode b, MonadIO m, TCPEnv env) => env -> m b
+receiveTCP e = do
+  vMb <- receiveTCPHelper $ getSock e
+  case vMb of
+    Just v  -> return v
+    Nothing -> throwString "Failed to receive or parse tracker response."
+  where
+    receiveTCPHelper :: (Decode b, MonadIO m) => TCP.Socket -> m ( Maybe b )
+    receiveTCPHelper sock = runMaybeT $ do
+      lenRaw <- MaybeT $ TCP.recv sock 4
+      len    <- MaybeT . return $ AP.parseOnly parseLengthPrefix lenRaw ^? _Right
+      hsRaw  <- MaybeT $ TCP.recv sock len
+      MaybeT . return $ AP.parseOnly decode ( lenRaw <> hsRaw ) ^? _Right
 
-instance HasTCP Env where
+instance TCPEnv TCP where
   getTCP = _eTCP
-  
 
 ----------------
 
@@ -98,7 +91,7 @@ class HasConnectionState a where
   getPeerState :: a -> IORef ConnState
   getClientState :: a -> IORef ConnState
 
-instance HasConnectionState Env where
+instance HasConnectionState TCP where
   getPeerState = _ePeerState
   getClientState = _eClientState
   
@@ -116,3 +109,4 @@ class Decode a where
 class (Encode a, Decode a) => Serialize a
 
 ------------------
+
